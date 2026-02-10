@@ -21,8 +21,16 @@ from PIL import Image
 
 INPUT_DIR = Path(r"C:\Users\Kevin\OneDrive\Desktop\Buch test input")
 OUTPUT_DIR = Path(r"C:\Users\Kevin\OneDrive\Desktop\Buch test input\Buch test Output")
-OUTPUT_AS_PDF = True
+OUTPUT_AS_PDF = False
 PDF_FILENAME = "book_scan.pdf"
+OUTPUT_FORMAT = "jpg"  # "jpg" or "png"
+JPEG_QUALITY = 98
+PNG_COMPRESSION = 3
+
+ENABLE_PERSPECTIVE_CORRECTION = True
+ENABLE_CROP = True
+ENABLE_DEWARP = False
+ENABLE_LIGHTING_NORMALIZATION = False
 
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -78,6 +86,11 @@ def build_page_mask(image: np.ndarray) -> np.ndarray:
 
     dist_u8 = cv2.normalize(dist, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     _, mask = cv2.threshold(dist_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # If we only captured text (very small foreground), invert to avoid text-only crops.
+    white_ratio = float(mask.mean() / 255.0)
+    if white_ratio < 0.18:
+        mask = cv2.bitwise_not(mask)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -202,29 +215,35 @@ def order_points(pts: np.ndarray) -> np.ndarray:
     return rect
 
 
-def find_page_contour(gray: np.ndarray) -> Optional[np.ndarray]:
+def find_page_contour(image: np.ndarray) -> Optional[np.ndarray]:
     """Find a robust page contour and return a quadrilateral if possible."""
-    h, w = gray.shape[:2]
-    edges = cv2.Canny(gray, 40, 120)
-    edges = cv2.dilate(edges, None, iterations=2)
+    mask = build_page_mask(image)
+    h, w = mask.shape[:2]
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
 
-    min_area = h * w * 0.25
-    for contour in sorted(contours, key=cv2.contourArea, reverse=True):
-        if cv2.contourArea(contour) < min_area:
-            continue
-        peri = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+    contour = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(contour) < h * w * 0.2:
+        return None
+
+    peri = cv2.arcLength(contour, True)
+    for eps in (0.015, 0.02, 0.03, 0.04):
+        approx = cv2.approxPolyDP(contour, eps * peri, True)
         if len(approx) == 4:
             return approx.reshape(4, 2).astype(np.float32)
 
-        x, y, bw, bh = cv2.boundingRect(contour)
-        return np.array([[x, y], [x + bw, y], [x + bw, y + bh], [x, y + bh]], dtype=np.float32)
+    hull = cv2.convexHull(contour)
+    peri = cv2.arcLength(hull, True)
+    for eps in (0.015, 0.02, 0.03, 0.04):
+        approx = cv2.approxPolyDP(hull, eps * peri, True)
+        if len(approx) == 4:
+            return approx.reshape(4, 2).astype(np.float32)
 
-    return None
+    rect = cv2.minAreaRect(contour)
+    box = cv2.boxPoints(rect)
+    return box.astype(np.float32)
 
 
 def crop_page(image: np.ndarray) -> np.ndarray:
@@ -235,6 +254,10 @@ def crop_page(image: np.ndarray) -> np.ndarray:
         return image
 
     c = max(contours, key=cv2.contourArea)
+    img_h, img_w = image.shape[:2]
+    if cv2.contourArea(c) < img_h * img_w * 0.35:
+        return image
+
     x, y, w, h = cv2.boundingRect(c)
     px = max(12, int(w * 0.02))
     py = max(12, int(h * 0.02))
@@ -249,8 +272,7 @@ def crop_page(image: np.ndarray) -> np.ndarray:
 
 def correct_perspective(image: np.ndarray) -> np.ndarray:
     """Apply perspective correction using detected page corners."""
-    gray = preprocess_image(image)
-    page = find_page_contour(gray)
+    page = find_page_contour(image)
     if page is None:
         return image
 
@@ -274,7 +296,7 @@ def correct_perspective(image: np.ndarray) -> np.ndarray:
     )
 
     matrix = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(image, matrix, (max_width, max_height))
+    return cv2.warpPerspective(image, matrix, (max_width, max_height), flags=cv2.INTER_CUBIC)
 
 
 def dewarp_page(image: np.ndarray) -> np.ndarray:
@@ -335,10 +357,12 @@ def save_pages_as_pdf(images: List[np.ndarray], output_dir: Path, filename: str)
 
 def process_page(image: np.ndarray) -> np.ndarray:
     """Process a single page through crop, perspective correction, dewarp, and lighting."""
-    cropped = crop_page(image)
-    corrected = correct_perspective(cropped)
-    dewarped = dewarp_page(corrected)
-    normalized = normalize_lighting(dewarped)
+    corrected = correct_perspective(image) if ENABLE_PERSPECTIVE_CORRECTION else image
+    cropped = crop_page(corrected) if ENABLE_CROP else corrected
+    dewarped = dewarp_page(cropped) if ENABLE_DEWARP else cropped
+    normalized = (
+        normalize_lighting(dewarped) if ENABLE_LIGHTING_NORMALIZATION else dewarped
+    )
     return normalized
 
 
