@@ -337,7 +337,7 @@ def normalize_lighting(image: np.ndarray) -> np.ndarray:
 def save_page(image: np.ndarray, output_dir: Path, index: int) -> None:
     """Save the processed page image with sequential naming."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    filename = output_dir / f"page_{index:04d}.jpg"
+    filename = output_dir / f"page_{index:04d}.{OUTPUT_FORMAT}"
     cv2.imwrite(str(filename), image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     logging.info("Saved %s", filename)
 
