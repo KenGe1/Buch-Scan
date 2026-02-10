@@ -17,9 +17,12 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+from PIL import Image
 
 INPUT_DIR = Path(r"C:\Users\Kevin\OneDrive\Desktop\Buch test input")
 OUTPUT_DIR = Path(r"C:\Users\Kevin\OneDrive\Desktop\Buch test input\Buch test Output")
+OUTPUT_AS_PDF = True
+PDF_FILENAME = "book_scan.pdf"
 
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -316,6 +319,19 @@ def save_page(image: np.ndarray, output_dir: Path, index: int) -> None:
     cv2.imwrite(str(filename), image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     logging.info("Saved %s", filename)
 
+def save_pages_as_pdf(images: List[np.ndarray], output_dir: Path, filename: str) -> None:
+    """Save all processed pages in order as one PDF file."""
+    if not images:
+        logging.warning("No processed pages available for PDF export.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = output_dir / filename
+
+    pil_pages = [Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)) for image in images]
+    first_page = pil_pages[0]
+    first_page.save(pdf_path, save_all=True, append_images=pil_pages[1:])
+    logging.info("Saved %s", pdf_path)
 
 def process_page(image: np.ndarray) -> np.ndarray:
     """Process a single page through crop, perspective correction, dewarp, and lighting."""
@@ -334,6 +350,7 @@ def main() -> None:
         return
 
     page_index = 1
+    processed_pages: List[np.ndarray] = []
     for image_path in image_paths:
         logging.info("Processing %s", image_path)
         try:
@@ -351,11 +368,17 @@ def main() -> None:
                 if processed.size == 0:
                     logging.warning("Skipping empty result for %s", image_path)
                     continue
-                save_page(processed, OUTPUT_DIR, page_index)
+                if OUTPUT_AS_PDF:
+                    processed_pages.append(processed)
+                else:
+                    save_page(processed, OUTPUT_DIR, page_index)
                 page_index += 1
 
         except Exception as exc:
             logging.exception("Error processing %s: %s", image_path, exc)
+
+    if OUTPUT_AS_PDF:
+        save_pages_as_pdf(processed_pages, OUTPUT_DIR, PDF_FILENAME)
 
 
 if __name__ == "__main__":
