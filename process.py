@@ -75,6 +75,33 @@ def _estimate_background_lab(image: np.ndarray) -> np.ndarray:
     return np.median(border_pixels, axis=0)
 
 
+def _filter_mask_components(mask: np.ndarray) -> np.ndarray:
+    """Drop tiny/slim components that are likely illustrations or background strips."""
+    h, w = mask.shape[:2]
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return mask
+
+    out = np.zeros_like(mask)
+    min_area = h * w * 0.012
+    min_h = h * 0.16
+    min_w = w * 0.10
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < min_area:
+            continue
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw < min_w or bh < min_h:
+            continue
+        aspect = bw / float(max(1, bh))
+        if aspect > 3.2 or aspect < 0.18:
+            continue
+        cv2.drawContours(out, [c], -1, 255, thickness=cv2.FILLED)
+
+    return out if np.any(out) else mask
+
+
 def build_page_mask(image: np.ndarray) -> np.ndarray:
     """Build a mask where the book/page region is white and background is black."""
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
@@ -96,9 +123,7 @@ def build_page_mask(image: np.ndarray) -> np.ndarray:
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
-    # Keep all cleaned components. The final page selection uses shape scoring,
-    # which is more robust than always taking the largest blob.
-    return mask
+    return _filter_mask_components(mask)
 
 
 def _page_shape_score(contour: np.ndarray, image_h: int, image_w: int) -> float:
@@ -113,16 +138,34 @@ def _page_shape_score(contour: np.ndarray, image_h: int, image_w: int) -> float:
     fill_ratio = area / rect_area
     aspect = bw / float(max(1, bh))
 
+    moments = cv2.moments(contour)
+    if abs(moments['m00']) < 1e-6:
+        cx, cy = x + (bw / 2.0), y + (bh / 2.0)
+    else:
+        cx = moments['m10'] / moments['m00']
+        cy = moments['m01'] / moments['m00']
+
+    center_dx = abs(cx - (image_w / 2.0)) / max(1.0, image_w / 2.0)
+    center_dy = abs(cy - (image_h / 2.0)) / max(1.0, image_h / 2.0)
+    center_score = max(0.0, 1.0 - (0.7 * center_dx + 0.3 * center_dy))
+
     # Page-like contours should have significant area, be reasonably rectangular,
     # and usually extend low in the image (useful against chapter-heading/text blobs).
-    aspect_score = max(0.0, 1.0 - min(abs(aspect - 0.75), abs(aspect - 1.4)) / 1.4)
+    aspect_score = max(0.0, 1.0 - min(abs(aspect - 0.75), abs(aspect - 1.35)) / 1.35)
     bottom_reach = (y + bh) / float(max(1, image_h))
 
+    # Penalize stripe-like detections.
+    strip_penalty = 0.0
+    if aspect > 2.6 or aspect < 0.28:
+        strip_penalty = 0.6
+
     return (
-        2.6 * area_ratio
-        + 0.9 * fill_ratio
-        + 0.45 * aspect_score
+        2.9 * area_ratio
+        + 1.0 * fill_ratio
+        + 0.55 * aspect_score
         + 0.35 * bottom_reach
+        + 0.75 * center_score
+        - strip_penalty
     )
 
 
@@ -133,8 +176,16 @@ def _select_best_page_contour(mask: np.ndarray) -> Optional[np.ndarray]:
     if not contours:
         return None
 
-    min_area = h * w * 0.06
-    candidates = [c for c in contours if cv2.contourArea(c) >= min_area]
+    min_area = h * w * 0.10
+    candidates = []
+    for c in contours:
+        if cv2.contourArea(c) < min_area:
+            continue
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw < w * 0.22 or bh < h * 0.30:
+            continue
+        candidates.append(c)
+
     if not candidates:
         return None
 
