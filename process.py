@@ -42,6 +42,7 @@ YOLO_MIN_AREA_RATIO = 0.16
 YOLO_MIN_SIDE_RATIO = 0.22
 YOLO_MIN_MASK_COVERAGE = 0.45
 YOLO_CENTER_WEIGHT = 0.20
+YOLO_MIN_RELATIVE_TO_CONTOUR = 0.72
 
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -96,6 +97,39 @@ def _mask_coverage(mask: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
         return 0.0
     return float((roi > 0).mean())
 
+
+
+
+def _largest_mask_component_bbox(mask: np.ndarray, roi: Tuple[int, int, int, int]) -> Optional[Tuple[int, int, int, int]]:
+    """Find mask-component bbox with strongest overlap to roi (x0,y0,x1,y1)."""
+    x0, y0, x1, y1 = roi
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+    if num_labels <= 1:
+        return None
+
+    best_bbox: Optional[Tuple[int, int, int, int]] = None
+    best_score = -1.0
+    roi_area = float(max(1, (x1 - x0) * (y1 - y0)))
+
+    for i in range(1, num_labels):
+        lx, ly, lw, lh, area = stats[i]
+        if area <= 0:
+            continue
+        bx0, by0 = int(lx), int(ly)
+        bx1, by1 = int(lx + lw), int(ly + lh)
+        inter = _bbox_iou((x0, y0, x1, y1), (bx0, by0, bx1, by1))
+
+        # Prefer components that overlap strongly and are not tiny versus YOLO ROI.
+        rel_area = float(area) / roi_area
+        score = 0.75 * inter + 0.25 * min(rel_area, 1.6)
+        if score > best_score:
+            best_score = score
+            best_bbox = (bx0, by0, bx1, by1)
+
+    return best_bbox
 
 def _detect_book_region_yolo(
     image: np.ndarray,
@@ -371,13 +405,33 @@ def detect_book_region_from_image(image: np.ndarray) -> Optional[Tuple[np.ndarra
     if yolo_region is None:
         return contour_region
 
+    _, yolo_bbox = yolo_region
+
+    # Snap YOLO to the strongest overlapping mask component; avoids illustration crops.
+    component_bbox = _largest_mask_component_bbox(mask, yolo_bbox)
+    if component_bbox is not None:
+        cx0, cy0, cx1, cy1 = component_bbox
+        contour = np.array([[[cx0, cy0]], [[cx1, cy0]], [[cx1, cy1]], [[cx0, cy1]]], dtype=np.int32)
+        yolo_region = (contour, component_bbox)
+        yolo_bbox = component_bbox
+
     if contour_region is None:
         return yolo_region
 
-    _, yolo_bbox = yolo_region
     _, contour_bbox = contour_region
-    # If YOLO strongly disagrees with mask-based detection, keep the contour region.
-    if _bbox_iou(yolo_bbox, contour_bbox) < 0.24 and _mask_coverage(mask, yolo_bbox) < 0.58:
+    yolo_area = float(max(1, (yolo_bbox[2] - yolo_bbox[0]) * (yolo_bbox[3] - yolo_bbox[1])))
+    contour_area = float(max(1, (contour_bbox[2] - contour_bbox[0]) * (contour_bbox[3] - contour_bbox[1])))
+    area_ratio = yolo_area / contour_area
+
+    overlap = _bbox_iou(yolo_bbox, contour_bbox)
+    yolo_cov = _mask_coverage(mask, yolo_bbox)
+
+    # Safety-first: if YOLO is much smaller than contour region, prefer contour to avoid cutting content.
+    if area_ratio < YOLO_MIN_RELATIVE_TO_CONTOUR:
+        return contour_region
+
+    # If YOLO strongly disagrees and is weakly supported by mask, keep contour.
+    if overlap < 0.28 and yolo_cov < 0.62:
         return contour_region
 
     return yolo_region

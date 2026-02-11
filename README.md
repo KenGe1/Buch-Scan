@@ -36,6 +36,7 @@ Wenn die klassische Kontur-Erkennung bei deinen Fotos instabil ist, kannst du YO
      - `YOLO_MIN_AREA_RATIO` (größere Werte filtern kleine/illustrationsartige Boxen)
      - `YOLO_MIN_MASK_COVERAGE` (größere Werte erzwingen bessere Übereinstimmung mit der Seitenmaske)
      - `YOLO_MIN_SIDE_RATIO` (filtern schmale Streifen)
+     - `YOLO_MIN_RELATIVE_TO_CONTOUR` (YOLO-Box darf nicht zu klein ggü. OpenCV-Region sein)
 2. Danach läuft die Pipeline so:
    - YOLO erkennt zuerst Buch-/Seitenbereich
    - Die Erkennung wird zusätzlich mit der vorhandenen Seitenmaske validiert (gegen schmale Fremdbereiche/Illustrationen)
