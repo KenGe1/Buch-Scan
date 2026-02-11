@@ -35,7 +35,7 @@ ENABLE_GLOBAL_ALIGNMENT = True
 
 # Optional YOLO-based page detection (recommended for unstable contour detections).
 ENABLE_YOLO_PAGE_DETECTION = True
-YOLO_MODEL_PATH = "yolov8n.pt"  # Can also be a custom page detector model.
+YOLO_MODEL_PATH = "yolo26s.pt"  # Can also be a custom page detector model.
 YOLO_CONFIDENCE = 0.75
 YOLO_IOU = 0.70
 YOLO_TARGET_CLASSES: Optional[List[str]] = ["book"]
