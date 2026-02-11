@@ -454,13 +454,14 @@ def dewarp_page(image: np.ndarray) -> np.ndarray:
 
     # Stronger at sides, weaker at gutter. Strength adapts with image size.
     y_coords, x_coords = np.indices((h, w), dtype=np.float32)
-    x_norm = np.abs((x_coords - gutter_x) / max(1.0, w / 2.0))
-    base_strength = np.clip(0.022 + (h / 3000.0), 0.02, 0.04)
-    y_offset = (x_norm**2) * base_strength * h
+    x_norm = np.abs((x_coords - np.float32(gutter_x)) / np.float32(max(1.0, w / 2.0)))
+    base_strength = float(np.clip(0.022 + (h / 3000.0), 0.02, 0.04))
+    y_offset = (x_norm**2) * np.float32(base_strength * h)
 
-    map_x = x_coords
-    map_y = np.clip(y_coords - y_offset, 0, h - 1)
-    return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR)
+    # OpenCV remap needs float32 mapping arrays.
+    map_x = np.ascontiguousarray(x_coords, dtype=np.float32)
+    map_y = np.ascontiguousarray(np.clip(y_coords - y_offset, 0, h - 1), dtype=np.float32)
+    return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
 
 def normalize_lighting(image: np.ndarray) -> np.ndarray:
