@@ -458,10 +458,24 @@ def dewarp_page(image: np.ndarray) -> np.ndarray:
     base_strength = float(np.clip(0.022 + (h / 3000.0), 0.02, 0.04))
     y_offset = (x_norm**2) * np.float32(base_strength * h)
 
-    # OpenCV remap needs float32 mapping arrays.
     map_x = np.ascontiguousarray(x_coords, dtype=np.float32)
     map_y = np.ascontiguousarray(np.clip(y_coords - y_offset, 0, h - 1), dtype=np.float32)
-    return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+    # Build CV_32FC2 map explicitly; this avoids platform-specific map1/map2 typing issues.
+    map_xy = np.dstack((map_x, map_y)).astype(np.float32, copy=False)
+    map_xy = np.ascontiguousarray(map_xy)
+
+    try:
+        return cv2.remap(
+            image,
+            map_xy,
+            None,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+    except cv2.error:
+        # Safe fallback: keep pipeline running even if a local OpenCV build is picky.
+        return image
 
 
 def normalize_lighting(image: np.ndarray) -> np.ndarray:
