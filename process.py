@@ -21,7 +21,7 @@ from PIL import Image
 
 INPUT_DIR = Path(r"C:\Users\Kevin\OneDrive\Desktop\Buch test input")
 OUTPUT_DIR = Path(r"C:\Users\Kevin\OneDrive\Desktop\Buch test input\Buch test Output")
-OUTPUT_AS_PDF = False
+OUTPUT_AS_PDF = True
 PDF_FILENAME = "book_scan.pdf"
 OUTPUT_FORMAT = "jpg"  # "jpg" or "png"
 JPEG_QUALITY = 98
@@ -31,9 +31,219 @@ ENABLE_PERSPECTIVE_CORRECTION = True
 ENABLE_CROP = True
 ENABLE_DEWARP = False
 ENABLE_LIGHTING_NORMALIZATION = False
+ENABLE_GLOBAL_ALIGNMENT = True
+
+# Optional YOLO-based page detection (recommended for unstable contour detections).
+ENABLE_YOLO_PAGE_DETECTION = True
+YOLO_MODEL_PATH = "yolov8n.pt"  # Can also be a custom page detector model.
+YOLO_CONFIDENCE = 0.75
+YOLO_IOU = 0.70
+YOLO_TARGET_CLASSES: Optional[List[str]] = ["book"]
+YOLO_MIN_AREA_RATIO = 0.30
+YOLO_MIN_SIDE_RATIO = 0.35
+YOLO_MIN_MASK_COVERAGE = 0.60
+YOLO_CENTER_WEIGHT = 0.70
+YOLO_MIN_RELATIVE_TO_CONTOUR = 0.75
+YOLO_MASTER_MODE = True
+YOLO_MASTER_MIN_IOU_FOR_CONTOUR_EXPAND = 0.10
+YOLO_MASTER_MAX_CONTOUR_EXPAND = 0.13
 
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+
+_YOLO_MODEL = None
+_YOLO_LOAD_ATTEMPTED = False
+
+
+def _get_yolo_model():
+    """Lazy-load an Ultralytics YOLO model if enabled and available."""
+    global _YOLO_MODEL, _YOLO_LOAD_ATTEMPTED
+    if not ENABLE_YOLO_PAGE_DETECTION:
+        return None
+    if _YOLO_MODEL is not None:
+        return _YOLO_MODEL
+    if _YOLO_LOAD_ATTEMPTED:
+        return None
+
+    _YOLO_LOAD_ATTEMPTED = True
+    try:
+        from ultralytics import YOLO  # type: ignore
+
+        _YOLO_MODEL = YOLO(YOLO_MODEL_PATH)
+        logging.info("Loaded YOLO model: %s", YOLO_MODEL_PATH)
+    except Exception as exc:
+        logging.warning("YOLO page detection disabled (load failed): %s", exc)
+        _YOLO_MODEL = None
+    return _YOLO_MODEL
+
+
+def _bbox_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+    """Intersection-over-union between two x0,y0,x1,y1 boxes."""
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
+    inter = float(iw * ih)
+    if inter <= 0.0:
+        return 0.0
+    area_a = float(max(1, (ax1 - ax0) * (ay1 - ay0)))
+    area_b = float(max(1, (bx1 - bx0) * (by1 - by0)))
+    return inter / max(1e-6, area_a + area_b - inter)
+
+
+def _mask_coverage(mask: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
+    """How much of the bbox is supported by the page mask."""
+    x0, y0, x1, y1 = bbox
+    roi = mask[y0:y1, x0:x1]
+    if roi.size == 0:
+        return 0.0
+    return float((roi > 0).mean())
+
+
+
+
+def _largest_mask_component_bbox(mask: np.ndarray, roi: Tuple[int, int, int, int]) -> Optional[Tuple[int, int, int, int]]:
+    """Find mask-component bbox with strongest overlap to roi (x0,y0,x1,y1)."""
+    x0, y0, x1, y1 = roi
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+    if num_labels <= 1:
+        return None
+
+    best_bbox: Optional[Tuple[int, int, int, int]] = None
+    best_score = -1.0
+    roi_area = float(max(1, (x1 - x0) * (y1 - y0)))
+
+    for i in range(1, num_labels):
+        lx, ly, lw, lh, area = stats[i]
+        if area <= 0:
+            continue
+        bx0, by0 = int(lx), int(ly)
+        bx1, by1 = int(lx + lw), int(ly + lh)
+        inter = _bbox_iou((x0, y0, x1, y1), (bx0, by0, bx1, by1))
+
+        # Prefer components that overlap strongly and are not tiny versus YOLO ROI.
+        rel_area = float(area) / roi_area
+        score = 0.75 * inter + 0.25 * min(rel_area, 1.6)
+        if score > best_score:
+            best_score = score
+            best_bbox = (bx0, by0, bx1, by1)
+
+    return best_bbox
+
+
+
+def _expand_bbox_towards(
+    master_bbox: Tuple[int, int, int, int],
+    helper_bbox: Tuple[int, int, int, int],
+    image_shape: Tuple[int, int],
+    max_expand_ratio: float,
+) -> Tuple[int, int, int, int]:
+    """Expand master bbox slightly towards helper bbox, bounded by max_expand_ratio."""
+    h, w = image_shape
+    mx0, my0, mx1, my1 = master_bbox
+    hx0, hy0, hx1, hy1 = helper_bbox
+
+    mw = max(1, mx1 - mx0)
+    mh = max(1, my1 - my0)
+    lim_x = int(mw * max_expand_ratio)
+    lim_y = int(mh * max_expand_ratio)
+
+    nx0 = max(0, mx0 - min(lim_x, max(0, mx0 - hx0)))
+    ny0 = max(0, my0 - min(lim_y, max(0, my0 - hy0)))
+    nx1 = min(w, mx1 + min(lim_x, max(0, hx1 - mx1)))
+    ny1 = min(h, my1 + min(lim_y, max(0, hy1 - my1)))
+    return nx0, ny0, nx1, ny1
+
+
+def _detect_book_region_yolo(
+    image: np.ndarray,
+    mask: np.ndarray,
+    expected_bbox: Optional[Tuple[int, int, int, int]] = None,
+) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
+    """Detect primary page/book box with YOLO, filtered by geometry and mask agreement."""
+    model = _get_yolo_model()
+    if model is None:
+        return None
+
+    try:
+        result = model.predict(image, conf=YOLO_CONFIDENCE, iou=YOLO_IOU, verbose=False)[0]
+    except Exception as exc:
+        logging.warning("YOLO inference failed, using contour fallback: %s", exc)
+        return None
+
+    if result.boxes is None or len(result.boxes) == 0:
+        return None
+
+    names = getattr(result, "names", {}) or {}
+    h, w = image.shape[:2]
+    allowed = {name.lower() for name in YOLO_TARGET_CLASSES} if YOLO_TARGET_CLASSES else None
+
+    best_box: Optional[Tuple[int, int, int, int]] = None
+    best_score = -1.0
+    for box in result.boxes:
+        cls_idx = int(box.cls[0].item()) if box.cls is not None else -1
+        cls_name = str(names.get(cls_idx, "")).lower()
+        if allowed and cls_name and cls_name not in allowed:
+            continue
+
+        x0, y0, x1, y1 = box.xyxy[0].cpu().numpy().tolist()
+        x0, y0 = int(max(0, x0)), int(max(0, y0))
+        x1, y1 = int(min(w, x1)), int(min(h, y1))
+        bw, bh = x1 - x0, y1 - y0
+        if bw <= 0 or bh <= 0:
+            continue
+
+        area_ratio = (bw * bh) / float(max(1, h * w))
+        if area_ratio < YOLO_MIN_AREA_RATIO:
+            continue
+        if bw < int(w * YOLO_MIN_SIDE_RATIO) or bh < int(h * YOLO_MIN_SIDE_RATIO):
+            continue
+
+        aspect = bw / float(max(1, bh))
+        if aspect > 2.25 or aspect < 0.38:
+            continue
+
+        candidate = (x0, y0, x1, y1)
+        coverage = _mask_coverage(mask, candidate)
+        if coverage < YOLO_MIN_MASK_COVERAGE:
+            continue
+
+        conf = float(box.conf[0].item()) if box.conf is not None else 0.0
+        center_x = (x0 + x1) / 2.0
+        center_bias = 1.0 - abs(center_x - (w / 2.0)) / max(1.0, (w / 2.0))
+        score = (conf * 0.50) + (area_ratio * 0.20) + (coverage * 0.30) + (YOLO_CENTER_WEIGHT * center_bias)
+
+        if expected_bbox is not None:
+            score += 0.35 * _bbox_iou(candidate, expected_bbox)
+
+        if score > best_score:
+            best_score = score
+            best_box = candidate
+
+    if best_box is None:
+        return None
+
+    x0, y0, x1, y1 = best_box
+    bw, bh = x1 - x0, y1 - y0
+    pad_x = max(12, int(bw * 0.02))
+    pad_y_top = max(10, int(bh * 0.018))
+    pad_y_bottom = max(18, int(bh * 0.05))
+
+    x0 = max(0, x0 - pad_x)
+    y0 = max(0, y0 - pad_y_top)
+    x1 = min(w, x1 + pad_x)
+    y1 = min(h, y1 + pad_y_bottom)
+
+    contour = np.array(
+        [[[x0, y0]], [[x1, y0]], [[x1, y1]], [[x0, y1]]],
+        dtype=np.int32,
+    )
+    return contour, (x0, y0, x1, y1)
 
 
 def load_images(input_dir: Path) -> List[Path]:
@@ -75,6 +285,33 @@ def _estimate_background_lab(image: np.ndarray) -> np.ndarray:
     return np.median(border_pixels, axis=0)
 
 
+def _filter_mask_components(mask: np.ndarray) -> np.ndarray:
+    """Drop tiny/slim components that are likely illustrations or background strips."""
+    h, w = mask.shape[:2]
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return mask
+
+    out = np.zeros_like(mask)
+    min_area = h * w * 0.012
+    min_h = h * 0.16
+    min_w = w * 0.10
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < min_area:
+            continue
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw < min_w or bh < min_h:
+            continue
+        aspect = bw / float(max(1, bh))
+        if aspect > 3.2 or aspect < 0.18:
+            continue
+        cv2.drawContours(out, [c], -1, 255, thickness=cv2.FILLED)
+
+    return out if np.any(out) else mask
+
+
 def build_page_mask(image: np.ndarray) -> np.ndarray:
     """Build a mask where the book/page region is white and background is black."""
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
@@ -96,15 +333,211 @@ def build_page_mask(image: np.ndarray) -> np.ndarray:
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
+    return _filter_mask_components(mask)
+
+
+def _page_shape_score(contour: np.ndarray, image_h: int, image_w: int) -> float:
+    """Score how likely a contour is a full page/book region (higher is better)."""
+    area = cv2.contourArea(contour)
+    if area <= 1:
+        return -1.0
+
+    x, y, bw, bh = cv2.boundingRect(contour)
+    rect_area = float(max(1, bw * bh))
+    area_ratio = area / float(image_h * image_w)
+    fill_ratio = area / rect_area
+    aspect = bw / float(max(1, bh))
+
+    moments = cv2.moments(contour)
+    if abs(moments['m00']) < 1e-6:
+        cx, cy = x + (bw / 2.0), y + (bh / 2.0)
+    else:
+        cx = moments['m10'] / moments['m00']
+        cy = moments['m01'] / moments['m00']
+
+    center_dx = abs(cx - (image_w / 2.0)) / max(1.0, image_w / 2.0)
+    center_dy = abs(cy - (image_h / 2.0)) / max(1.0, image_h / 2.0)
+    center_score = max(0.0, 1.0 - (0.7 * center_dx + 0.3 * center_dy))
+
+    # Page-like contours should have significant area, be reasonably rectangular,
+    # and usually extend low in the image (useful against chapter-heading/text blobs).
+    aspect_score = max(0.0, 1.0 - min(abs(aspect - 0.75), abs(aspect - 1.35)) / 1.35)
+    bottom_reach = (y + bh) / float(max(1, image_h))
+
+    # Penalize stripe-like detections.
+    strip_penalty = 0.0
+    if aspect > 2.6 or aspect < 0.28:
+        strip_penalty = 0.6
+
+    return (
+        2.9 * area_ratio
+        + 1.0 * fill_ratio
+        + 0.55 * aspect_score
+        + 0.35 * bottom_reach
+        + 0.75 * center_score
+        - strip_penalty
+    )
+
+
+def _select_best_page_contour(mask: np.ndarray) -> Optional[np.ndarray]:
+    """Select the most page-like contour from the cleaned mask."""
+    h, w = mask.shape[:2]
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return mask
+        return None
 
-    # Keep the largest connected component as book/object region.
-    largest = max(contours, key=cv2.contourArea)
-    out = np.zeros_like(mask)
-    cv2.drawContours(out, [largest], -1, 255, thickness=cv2.FILLED)
-    return out
+    min_area = h * w * 0.10
+    candidates = []
+    for c in contours:
+        if cv2.contourArea(c) < min_area:
+            continue
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw < w * 0.22 or bh < h * 0.30:
+            continue
+        candidates.append(c)
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda c: _page_shape_score(c, h, w))
+
+
+def detect_book_region(mask: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
+    """Return the most likely page/book contour and a padded bounding box."""
+    h, w = mask.shape[:2]
+    contour = _select_best_page_contour(mask)
+    if contour is None:
+        return None
+
+    x, y, bw, bh = cv2.boundingRect(contour)
+    pad_x = max(12, int(bw * 0.025))
+    pad_y_top = max(10, int(bh * 0.02))
+    pad_y_bottom = max(18, int(bh * 0.055))
+    x0 = max(0, x - pad_x)
+    y0 = max(0, y - pad_y_top)
+    x1 = min(w, x + bw + pad_x)
+    y1 = min(h, y + bh + pad_y_bottom)
+
+    return contour, (x0, y0, x1, y1)
+
+
+def detect_book_region_from_image(image: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
+    """Detect main page/book region with YOLO as master and contour as optional helper."""
+    mask = build_page_mask(image)
+    contour_region = detect_book_region(mask)
+
+    if not ENABLE_YOLO_PAGE_DETECTION:
+        return contour_region
+
+    expected_bbox = contour_region[1] if contour_region is not None else None
+    yolo_region = _detect_book_region_yolo(image, mask, expected_bbox=expected_bbox)
+    if yolo_region is None:
+        return contour_region
+
+    _, yolo_bbox = yolo_region
+
+    # Snap YOLO to the strongest overlapping mask component; avoids illustration crops.
+    component_bbox = _largest_mask_component_bbox(mask, yolo_bbox)
+    if component_bbox is not None:
+        cx0, cy0, cx1, cy1 = component_bbox
+        yolo_bbox = (cx0, cy0, cx1, cy1)
+
+    if YOLO_MASTER_MODE:
+        final_bbox = yolo_bbox
+        if contour_region is not None:
+            _, contour_bbox = contour_region
+            overlap = _bbox_iou(yolo_bbox, contour_bbox)
+            if overlap >= YOLO_MASTER_MIN_IOU_FOR_CONTOUR_EXPAND:
+                final_bbox = _expand_bbox_towards(
+                    yolo_bbox,
+                    contour_bbox,
+                    image.shape[:2],
+                    YOLO_MASTER_MAX_CONTOUR_EXPAND,
+                )
+        fx0, fy0, fx1, fy1 = final_bbox
+        contour = np.array([[[fx0, fy0]], [[fx1, fy0]], [[fx1, fy1]], [[fx0, fy1]]], dtype=np.int32)
+        return contour, final_bbox
+
+    if contour_region is None:
+        cx0, cy0, cx1, cy1 = yolo_bbox
+        contour = np.array([[[cx0, cy0]], [[cx1, cy0]], [[cx1, cy1]], [[cx0, cy1]]], dtype=np.int32)
+        return contour, yolo_bbox
+
+    _, contour_bbox = contour_region
+    yolo_area = float(max(1, (yolo_bbox[2] - yolo_bbox[0]) * (yolo_bbox[3] - yolo_bbox[1])))
+    contour_area = float(max(1, (contour_bbox[2] - contour_bbox[0]) * (contour_bbox[3] - contour_bbox[1])))
+    area_ratio = yolo_area / contour_area
+
+    overlap = _bbox_iou(yolo_bbox, contour_bbox)
+    yolo_cov = _mask_coverage(mask, yolo_bbox)
+
+    if area_ratio < YOLO_MIN_RELATIVE_TO_CONTOUR:
+        return contour_region
+
+    if overlap < 0.28 and yolo_cov < 0.62:
+        return contour_region
+
+    cx0, cy0, cx1, cy1 = yolo_bbox
+    contour = np.array([[[cx0, cy0]], [[cx1, cy0]], [[cx1, cy1]], [[cx0, cy1]]], dtype=np.int32)
+    return contour, yolo_bbox
+
+
+def _rotation_from_contour(contour: np.ndarray) -> float:
+    """Estimate small deskew angle (degrees) from the full book contour."""
+    rect = cv2.minAreaRect(contour)
+    (_, _), (rw, rh), angle = rect
+
+    if rw < 1 or rh < 1:
+        return 0.0
+
+    # OpenCV angle is in [-90, 0): normalize to a small correction around 0.
+    if rw < rh:
+        angle = angle + 90.0
+    if angle > 45:
+        angle -= 90
+    if angle < -45:
+        angle += 90
+
+    return float(np.clip(angle, -20.0, 20.0))
+
+
+def rotate_image(image: np.ndarray, angle: float) -> np.ndarray:
+    """Rotate image around center while preserving full canvas."""
+    if abs(angle) < 0.15:
+        return image
+
+    h, w = image.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+    cos = abs(matrix[0, 0])
+    sin = abs(matrix[0, 1])
+    new_w = int((h * sin) + (w * cos))
+    new_h = int((h * cos) + (w * sin))
+
+    matrix[0, 2] += (new_w / 2.0) - center[0]
+    matrix[1, 2] += (new_h / 2.0) - center[1]
+
+    return cv2.warpAffine(image, matrix, (new_w, new_h), flags=cv2.INTER_CUBIC)
+
+
+def align_book_image(image: np.ndarray) -> np.ndarray:
+    """Globally align the entire book before split/crop/warp operations."""
+    if not ENABLE_GLOBAL_ALIGNMENT:
+        return image
+
+    region = detect_book_region_from_image(image)
+    if region is None:
+        return image
+
+    contour, _ = region
+    angle = _rotation_from_contour(contour)
+    if abs(angle) < 0.35:
+        return image
+
+    aligned = rotate_image(image, angle)
+    logging.debug("Applied global deskew: %.2f°", angle)
+    return aligned
 
 
 def detect_page_boxes(image: np.ndarray) -> List[Tuple[int, int, int, int]]:
@@ -112,11 +545,17 @@ def detect_page_boxes(image: np.ndarray) -> List[Tuple[int, int, int, int]]:
     mask = build_page_mask(image)
     h, w = mask.shape[:2]
 
+    region = detect_book_region_from_image(image)
+    if region is None:
+        return []
+
+    _, (bx0, by0, bx1, by1) = region
+
     # Try to split the book mask into left/right components at detected seam.
     seam_x, seam_conf = find_split_line(image)
     boxes: List[Tuple[int, int, int, int]] = []
 
-    if seam_conf > 0.08 and int(w * 0.2) < seam_x < int(w * 0.8):
+    if seam_conf > 0.08 and bx0 + int((bx1 - bx0) * 0.2) < seam_x < bx1 - int((bx1 - bx0) * 0.2):
         left_mask = mask.copy()
         right_mask = mask.copy()
         left_mask[:, seam_x + 2 :] = 0
@@ -133,8 +572,8 @@ def detect_page_boxes(image: np.ndarray) -> List[Tuple[int, int, int, int]]:
             x, y, bw, bh = cv2.boundingRect(c)
             px = max(8, int(bw * 0.02))
             py = max(8, int(bh * 0.02))
-            x0, y0 = max(0, x - px), max(0, y - py)
-            x1, y1 = min(w, x + bw + px), min(h, y + bh + py)
+            x0, y0 = max(bx0, x - px), max(by0, y - py)
+            x1, y1 = min(bx1, x + bw + px), min(by1, y + bh + py)
             boxes.append((x0, y0, x1 - x0, y1 - y0))
 
     boxes.sort(key=lambda b: b[0])
@@ -146,8 +585,16 @@ def find_split_line(image: np.ndarray) -> Tuple[int, float]:
     gray = preprocess_image(image)
     h, w = gray.shape[:2]
 
-    center = w // 2
-    window = max(20, w // 5)
+    region = detect_book_region_from_image(image)
+    if region is not None:
+        _, (bx0, _, bx1, _) = region
+        center = (bx0 + bx1) // 2
+        book_w = max(1, bx1 - bx0)
+        window = max(20, int(book_w * 0.28))
+    else:
+        center = w // 2
+        window = max(20, w // 5)
+
     start = max(0, center - window)
     end = min(w, center + window)
 
@@ -161,7 +608,11 @@ def find_split_line(image: np.ndarray) -> Tuple[int, float]:
 
     # Gutter tends to be slightly darker and has clear edge transitions.
     darkness = (q90.max() - q70).astype(np.float32)
-    score = darkness + 0.8 * edge_strength
+
+    idx = np.arange(score_width := region.shape[1], dtype=np.float32)
+    center_bias = 1.0 - np.clip(np.abs(idx - (score_width / 2.0)) / max(1.0, score_width / 2.0), 0, 1)
+    # Soft center prior reduces false splits from edge illustrations.
+    score = darkness + 0.85 * edge_strength + 0.15 * center_bias * np.max(darkness + 1e-6)
 
     local_idx = int(np.argmax(score))
     split_x = start + local_idx
@@ -181,18 +632,24 @@ def is_double_page(image: np.ndarray) -> bool:
 
     seam_x, seam_conf = find_split_line(image)
     has_center_seam = seam_conf > 0.10 and int(w * 0.22) < seam_x < int(w * 0.78)
+    if has_center_seam:
+        return True
 
+    # Expensive fallback only when seam signal is weak/ambiguous.
     boxes = detect_page_boxes(image)
-    has_two_boxes = len(boxes) == 2
-
-    return has_center_seam or has_two_boxes
+    return len(boxes) == 2
 
 
 def split_double_page(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Split a double-page image into left and right pages with overlap safety."""
     h, w = image.shape[:2]
     seam_x, _ = find_split_line(image)
-    seam_x = int(np.clip(seam_x, int(w * 0.25), int(w * 0.75)))
+    region = detect_book_region_from_image(image)
+    if region is not None:
+        _, (bx0, _, bx1, _) = region
+        seam_x = int(np.clip(seam_x, bx0 + int((bx1 - bx0) * 0.2), bx1 - int((bx1 - bx0) * 0.2)))
+    else:
+        seam_x = int(np.clip(seam_x, int(w * 0.25), int(w * 0.75)))
 
     # Small overlap prevents cutting text exactly on gutter.
     overlap = max(8, int(w * 0.01))
@@ -217,15 +674,17 @@ def order_points(pts: np.ndarray) -> np.ndarray:
 
 def find_page_contour(image: np.ndarray) -> Optional[np.ndarray]:
     """Find a robust page contour and return a quadrilateral if possible."""
+    if ENABLE_YOLO_PAGE_DETECTION:
+        region = detect_book_region_from_image(image)
+        if region is not None:
+            _, (x0, y0, x1, y1) = region
+            return np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+
     mask = build_page_mask(image)
     h, w = mask.shape[:2]
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    contour = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(contour) < h * w * 0.2:
+    contour = _select_best_page_contour(mask)
+    if contour is None:
         return None
 
     peri = cv2.arcLength(contour, True)
@@ -248,24 +707,29 @@ def find_page_contour(image: np.ndarray) -> Optional[np.ndarray]:
 
 def crop_page(image: np.ndarray) -> np.ndarray:
     """Crop image to the primary page region while preserving borders."""
-    mask = build_page_mask(image)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+    region = detect_book_region_from_image(image)
+    if region is None:
         return image
 
-    c = max(contours, key=cv2.contourArea)
+    c, (bx0, by0, bx1, by1) = region
     img_h, img_w = image.shape[:2]
     if cv2.contourArea(c) < img_h * img_w * 0.35:
         return image
 
     x, y, w, h = cv2.boundingRect(c)
     px = max(12, int(w * 0.02))
-    py = max(12, int(h * 0.02))
+    py_top = max(12, int(h * 0.02))
+    py_bottom = max(18, int(h * 0.07))
 
-    x0 = max(0, x - px)
-    y0 = max(0, y - py)
-    x1 = min(image.shape[1], x + w + px)
-    y1 = min(image.shape[0], y + h + py)
+    contour_bottom = int(np.percentile(c[:, 0, 1], 98))
+    x0 = max(bx0, x - px)
+    y0 = max(by0, y - py_top)
+    x1 = min(bx1, x + w + px)
+    y1 = min(by1, max(y + h + py_bottom, contour_bottom + py_bottom))
+
+    # Bottom safety: avoid common under-crop on the page footline.
+    min_bottom = by0 + int((by1 - by0) * 0.96)
+    y1 = max(y1, min(by1, min_bottom))
 
     return image[y0:y1, x0:x1]
 
@@ -300,20 +764,46 @@ def correct_perspective(image: np.ndarray) -> np.ndarray:
 
 
 def dewarp_page(image: np.ndarray) -> np.ndarray:
-    """Apply mild vertical dewarping to flatten book curvature near the gutter."""
+    """Apply adaptive vertical dewarping to flatten paper curvature near the gutter."""
     h, w = image.shape[:2]
-    if h < 300 or w < 300:
+    if h < 260 or w < 260:
         return image
 
+    gray = preprocess_image(image)
+    col_mean = gray.mean(axis=0)
+    center = w // 2
+    search = max(20, int(w * 0.2))
+    s0, s1 = max(0, center - search), min(w, center + search)
+    if s1 - s0 < 12:
+        return image
+
+    local = col_mean[s0:s1]
+    gutter_x = s0 + int(np.argmin(local))
+
+    # Stronger at sides, weaker at gutter. Strength adapts with image size.
     y_coords, x_coords = np.indices((h, w), dtype=np.float32)
-    x_norm = (x_coords - (w / 2.0)) / (w / 2.0)
-    strength = 0.02
+    x_norm = np.abs((x_coords - np.float32(gutter_x)) / np.float32(max(1.0, w / 2.0)))
+    base_strength = float(np.clip(0.022 + (h / 3000.0), 0.02, 0.04))
+    y_offset = (x_norm**2) * np.float32(base_strength * h)
 
-    y_offset = (x_norm**2) * strength * h
-    map_x = x_coords
-    map_y = np.clip(y_coords - y_offset, 0, h - 1)
+    map_x = np.ascontiguousarray(x_coords, dtype=np.float32)
+    map_y = np.ascontiguousarray(np.clip(y_coords - y_offset, 0, h - 1), dtype=np.float32)
 
-    return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR)
+    # Build CV_32FC2 map explicitly; this avoids platform-specific map1/map2 typing issues.
+    map_xy = np.dstack((map_x, map_y)).astype(np.float32, copy=False)
+    map_xy = np.ascontiguousarray(map_xy)
+
+    try:
+        return cv2.remap(
+            image,
+            map_xy,
+            None,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+    except cv2.error:
+        # Safe fallback: keep pipeline running even if a local OpenCV build is picky.
+        return image
 
 
 def normalize_lighting(image: np.ndarray) -> np.ndarray:
@@ -355,9 +845,10 @@ def save_pages_as_pdf(images: List[np.ndarray], output_dir: Path, filename: str)
     first_page.save(pdf_path, save_all=True, append_images=pil_pages[1:])
     logging.info("Saved %s", pdf_path)
 
-def process_page(image: np.ndarray) -> np.ndarray:
+def process_page(image: np.ndarray, *, already_aligned: bool = False) -> np.ndarray:
     """Process a single page through crop, perspective correction, dewarp, and lighting."""
-    corrected = correct_perspective(image) if ENABLE_PERSPECTIVE_CORRECTION else image
+    aligned = image if already_aligned else align_book_image(image)
+    corrected = correct_perspective(aligned) if ENABLE_PERSPECTIVE_CORRECTION else aligned
     cropped = crop_page(corrected) if ENABLE_CROP else corrected
     dewarped = dewarp_page(cropped) if ENABLE_DEWARP else cropped
     normalized = (
@@ -383,6 +874,8 @@ def main() -> None:
                 logging.error("Failed to read image: %s", image_path)
                 continue
 
+            # Keep split detection on original image for speed; each output page
+            # is aligned once in process_page().
             pages = [image]
             if is_double_page(image):
                 pages = list(split_double_page(image))
