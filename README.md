@@ -37,10 +37,12 @@ Wenn die klassische Kontur-Erkennung bei deinen Fotos instabil ist, kannst du YO
      - `YOLO_MIN_MASK_COVERAGE` (größere Werte erzwingen bessere Übereinstimmung mit der Seitenmaske)
      - `YOLO_MIN_SIDE_RATIO` (filtern schmale Streifen)
      - `YOLO_MIN_RELATIVE_TO_CONTOUR` (YOLO-Box darf nicht zu klein ggü. OpenCV-Region sein)
+     - `YOLO_MASTER_MODE` (Standard: `True`, YOLO ist die führende Quelle)
+     - `YOLO_MASTER_MAX_CONTOUR_EXPAND` (optional: kleine Sicherheits-Erweiterung in Richtung OpenCV)
 2. Danach läuft die Pipeline so:
    - YOLO erkennt zuerst Buch-/Seitenbereich
    - Die Erkennung wird zusätzlich mit der vorhandenen Seitenmaske validiert (gegen schmale Fremdbereiche/Illustrationen)
-   - Wenn YOLO und OpenCV stark widersprechen, gewinnt automatisch die stabilere OpenCV-Region
+   - Standardmäßig ist YOLO der Master und OpenCV dient nur noch als sanfte Sicherheits-Erweiterung
    - Cropping, Perspective, Dewarping nutzen die final gewählte robuste Region
    - Falls YOLO nicht verfügbar ist oder nichts findet, wird automatisch auf die bisherige OpenCV-Logik zurückgefallen
 

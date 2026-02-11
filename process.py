@@ -43,6 +43,9 @@ YOLO_MIN_SIDE_RATIO = 0.22
 YOLO_MIN_MASK_COVERAGE = 0.45
 YOLO_CENTER_WEIGHT = 0.20
 YOLO_MIN_RELATIVE_TO_CONTOUR = 0.72
+YOLO_MASTER_MODE = True
+YOLO_MASTER_MIN_IOU_FOR_CONTOUR_EXPAND = 0.08
+YOLO_MASTER_MAX_CONTOUR_EXPAND = 0.18
 
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -130,6 +133,31 @@ def _largest_mask_component_bbox(mask: np.ndarray, roi: Tuple[int, int, int, int
             best_bbox = (bx0, by0, bx1, by1)
 
     return best_bbox
+
+
+
+def _expand_bbox_towards(
+    master_bbox: Tuple[int, int, int, int],
+    helper_bbox: Tuple[int, int, int, int],
+    image_shape: Tuple[int, int],
+    max_expand_ratio: float,
+) -> Tuple[int, int, int, int]:
+    """Expand master bbox slightly towards helper bbox, bounded by max_expand_ratio."""
+    h, w = image_shape
+    mx0, my0, mx1, my1 = master_bbox
+    hx0, hy0, hx1, hy1 = helper_bbox
+
+    mw = max(1, mx1 - mx0)
+    mh = max(1, my1 - my0)
+    lim_x = int(mw * max_expand_ratio)
+    lim_y = int(mh * max_expand_ratio)
+
+    nx0 = max(0, mx0 - min(lim_x, max(0, mx0 - hx0)))
+    ny0 = max(0, my0 - min(lim_y, max(0, my0 - hy0)))
+    nx1 = min(w, mx1 + min(lim_x, max(0, hx1 - mx1)))
+    ny1 = min(h, my1 + min(lim_y, max(0, hy1 - my1)))
+    return nx0, ny0, nx1, ny1
+
 
 def _detect_book_region_yolo(
     image: np.ndarray,
@@ -393,7 +421,7 @@ def detect_book_region(mask: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int
 
 
 def detect_book_region_from_image(image: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
-    """Detect main page/book region using a robust fusion of contour + optional YOLO."""
+    """Detect main page/book region with YOLO as master and contour as optional helper."""
     mask = build_page_mask(image)
     contour_region = detect_book_region(mask)
 
@@ -411,12 +439,28 @@ def detect_book_region_from_image(image: np.ndarray) -> Optional[Tuple[np.ndarra
     component_bbox = _largest_mask_component_bbox(mask, yolo_bbox)
     if component_bbox is not None:
         cx0, cy0, cx1, cy1 = component_bbox
-        contour = np.array([[[cx0, cy0]], [[cx1, cy0]], [[cx1, cy1]], [[cx0, cy1]]], dtype=np.int32)
-        yolo_region = (contour, component_bbox)
-        yolo_bbox = component_bbox
+        yolo_bbox = (cx0, cy0, cx1, cy1)
+
+    if YOLO_MASTER_MODE:
+        final_bbox = yolo_bbox
+        if contour_region is not None:
+            _, contour_bbox = contour_region
+            overlap = _bbox_iou(yolo_bbox, contour_bbox)
+            if overlap >= YOLO_MASTER_MIN_IOU_FOR_CONTOUR_EXPAND:
+                final_bbox = _expand_bbox_towards(
+                    yolo_bbox,
+                    contour_bbox,
+                    image.shape[:2],
+                    YOLO_MASTER_MAX_CONTOUR_EXPAND,
+                )
+        fx0, fy0, fx1, fy1 = final_bbox
+        contour = np.array([[[fx0, fy0]], [[fx1, fy0]], [[fx1, fy1]], [[fx0, fy1]]], dtype=np.int32)
+        return contour, final_bbox
 
     if contour_region is None:
-        return yolo_region
+        cx0, cy0, cx1, cy1 = yolo_bbox
+        contour = np.array([[[cx0, cy0]], [[cx1, cy0]], [[cx1, cy1]], [[cx0, cy1]]], dtype=np.int32)
+        return contour, yolo_bbox
 
     _, contour_bbox = contour_region
     yolo_area = float(max(1, (yolo_bbox[2] - yolo_bbox[0]) * (yolo_bbox[3] - yolo_bbox[1])))
@@ -426,15 +470,15 @@ def detect_book_region_from_image(image: np.ndarray) -> Optional[Tuple[np.ndarra
     overlap = _bbox_iou(yolo_bbox, contour_bbox)
     yolo_cov = _mask_coverage(mask, yolo_bbox)
 
-    # Safety-first: if YOLO is much smaller than contour region, prefer contour to avoid cutting content.
     if area_ratio < YOLO_MIN_RELATIVE_TO_CONTOUR:
         return contour_region
 
-    # If YOLO strongly disagrees and is weakly supported by mask, keep contour.
     if overlap < 0.28 and yolo_cov < 0.62:
         return contour_region
 
-    return yolo_region
+    cx0, cy0, cx1, cy1 = yolo_bbox
+    contour = np.array([[[cx0, cy0]], [[cx1, cy0]], [[cx1, cy1]], [[cx0, cy1]]], dtype=np.int32)
+    return contour, yolo_bbox
 
 
 def _rotation_from_contour(contour: np.ndarray) -> float:
