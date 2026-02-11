@@ -107,16 +107,101 @@ def build_page_mask(image: np.ndarray) -> np.ndarray:
     return out
 
 
+def detect_book_region(mask: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
+    """Return the main book contour and a padded bounding box from a foreground mask."""
+    h, w = mask.shape[:2]
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    contour = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(contour)
+    if area < h * w * 0.12:
+        return None
+
+    x, y, bw, bh = cv2.boundingRect(contour)
+    pad_x = max(10, int(bw * 0.02))
+    pad_y = max(10, int(bh * 0.02))
+    x0 = max(0, x - pad_x)
+    y0 = max(0, y - pad_y)
+    x1 = min(w, x + bw + pad_x)
+    y1 = min(h, y + bh + pad_y)
+
+    return contour, (x0, y0, x1, y1)
+
+
+def _rotation_from_contour(contour: np.ndarray) -> float:
+    """Estimate small deskew angle (degrees) from the full book contour."""
+    rect = cv2.minAreaRect(contour)
+    (_, _), (rw, rh), angle = rect
+
+    if rw < 1 or rh < 1:
+        return 0.0
+
+    # OpenCV angle is in [-90, 0): normalize to a small correction around 0.
+    if rw < rh:
+        angle = angle + 90.0
+    if angle > 45:
+        angle -= 90
+    if angle < -45:
+        angle += 90
+
+    return float(np.clip(angle, -20.0, 20.0))
+
+
+def rotate_image(image: np.ndarray, angle: float) -> np.ndarray:
+    """Rotate image around center while preserving full canvas."""
+    if abs(angle) < 0.15:
+        return image
+
+    h, w = image.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+    cos = abs(matrix[0, 0])
+    sin = abs(matrix[0, 1])
+    new_w = int((h * sin) + (w * cos))
+    new_h = int((h * cos) + (w * sin))
+
+    matrix[0, 2] += (new_w / 2.0) - center[0]
+    matrix[1, 2] += (new_h / 2.0) - center[1]
+
+    return cv2.warpAffine(image, matrix, (new_w, new_h), flags=cv2.INTER_CUBIC)
+
+
+def align_book_image(image: np.ndarray) -> np.ndarray:
+    """Globally align the entire book before split/crop/warp operations."""
+    mask = build_page_mask(image)
+    region = detect_book_region(mask)
+    if region is None:
+        return image
+
+    contour, _ = region
+    angle = _rotation_from_contour(contour)
+    if abs(angle) < 0.35:
+        return image
+
+    aligned = rotate_image(image, angle)
+    logging.debug("Applied global deskew: %.2f°", angle)
+    return aligned
+
+
 def detect_page_boxes(image: np.ndarray) -> List[Tuple[int, int, int, int]]:
     """Detect candidate page boxes sorted left-to-right."""
     mask = build_page_mask(image)
     h, w = mask.shape[:2]
 
+    region = detect_book_region(mask)
+    if region is None:
+        return []
+
+    _, (bx0, by0, bx1, by1) = region
+
     # Try to split the book mask into left/right components at detected seam.
     seam_x, seam_conf = find_split_line(image)
     boxes: List[Tuple[int, int, int, int]] = []
 
-    if seam_conf > 0.08 and int(w * 0.2) < seam_x < int(w * 0.8):
+    if seam_conf > 0.08 and bx0 + int((bx1 - bx0) * 0.2) < seam_x < bx1 - int((bx1 - bx0) * 0.2):
         left_mask = mask.copy()
         right_mask = mask.copy()
         left_mask[:, seam_x + 2 :] = 0
@@ -133,8 +218,8 @@ def detect_page_boxes(image: np.ndarray) -> List[Tuple[int, int, int, int]]:
             x, y, bw, bh = cv2.boundingRect(c)
             px = max(8, int(bw * 0.02))
             py = max(8, int(bh * 0.02))
-            x0, y0 = max(0, x - px), max(0, y - py)
-            x1, y1 = min(w, x + bw + px), min(h, y + bh + py)
+            x0, y0 = max(bx0, x - px), max(by0, y - py)
+            x1, y1 = min(bx1, x + bw + px), min(by1, y + bh + py)
             boxes.append((x0, y0, x1 - x0, y1 - y0))
 
     boxes.sort(key=lambda b: b[0])
@@ -146,8 +231,17 @@ def find_split_line(image: np.ndarray) -> Tuple[int, float]:
     gray = preprocess_image(image)
     h, w = gray.shape[:2]
 
-    center = w // 2
-    window = max(20, w // 5)
+    mask = build_page_mask(image)
+    region = detect_book_region(mask)
+    if region is not None:
+        _, (bx0, _, bx1, _) = region
+        center = (bx0 + bx1) // 2
+        book_w = max(1, bx1 - bx0)
+        window = max(20, int(book_w * 0.28))
+    else:
+        center = w // 2
+        window = max(20, w // 5)
+
     start = max(0, center - window)
     end = min(w, center + window)
 
@@ -161,7 +255,11 @@ def find_split_line(image: np.ndarray) -> Tuple[int, float]:
 
     # Gutter tends to be slightly darker and has clear edge transitions.
     darkness = (q90.max() - q70).astype(np.float32)
-    score = darkness + 0.8 * edge_strength
+
+    idx = np.arange(score_width := region.shape[1], dtype=np.float32)
+    center_bias = 1.0 - np.clip(np.abs(idx - (score_width / 2.0)) / max(1.0, score_width / 2.0), 0, 1)
+    # Soft center prior reduces false splits from edge illustrations.
+    score = darkness + 0.85 * edge_strength + 0.15 * center_bias * np.max(darkness + 1e-6)
 
     local_idx = int(np.argmax(score))
     split_x = start + local_idx
@@ -192,7 +290,13 @@ def split_double_page(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Split a double-page image into left and right pages with overlap safety."""
     h, w = image.shape[:2]
     seam_x, _ = find_split_line(image)
-    seam_x = int(np.clip(seam_x, int(w * 0.25), int(w * 0.75)))
+    mask = build_page_mask(image)
+    region = detect_book_region(mask)
+    if region is not None:
+        _, (bx0, _, bx1, _) = region
+        seam_x = int(np.clip(seam_x, bx0 + int((bx1 - bx0) * 0.2), bx1 - int((bx1 - bx0) * 0.2)))
+    else:
+        seam_x = int(np.clip(seam_x, int(w * 0.25), int(w * 0.75)))
 
     # Small overlap prevents cutting text exactly on gutter.
     overlap = max(8, int(w * 0.01))
@@ -249,23 +353,23 @@ def find_page_contour(image: np.ndarray) -> Optional[np.ndarray]:
 def crop_page(image: np.ndarray) -> np.ndarray:
     """Crop image to the primary page region while preserving borders."""
     mask = build_page_mask(image)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+    region = detect_book_region(mask)
+    if region is None:
         return image
 
-    c = max(contours, key=cv2.contourArea)
+    c, (bx0, by0, bx1, by1) = region
     img_h, img_w = image.shape[:2]
     if cv2.contourArea(c) < img_h * img_w * 0.35:
         return image
 
     x, y, w, h = cv2.boundingRect(c)
-    px = max(12, int(w * 0.02))
+    px = max(12, int(w * 0.018))
     py = max(12, int(h * 0.02))
 
-    x0 = max(0, x - px)
-    y0 = max(0, y - py)
-    x1 = min(image.shape[1], x + w + px)
-    y1 = min(image.shape[0], y + h + py)
+    x0 = max(bx0, x - px)
+    y0 = max(by0, y - py)
+    x1 = min(bx1, x + w + px)
+    y1 = min(by1, y + h + py)
 
     return image[y0:y1, x0:x1]
 
@@ -357,7 +461,8 @@ def save_pages_as_pdf(images: List[np.ndarray], output_dir: Path, filename: str)
 
 def process_page(image: np.ndarray) -> np.ndarray:
     """Process a single page through crop, perspective correction, dewarp, and lighting."""
-    corrected = correct_perspective(image) if ENABLE_PERSPECTIVE_CORRECTION else image
+    aligned = align_book_image(image)
+    corrected = correct_perspective(aligned) if ENABLE_PERSPECTIVE_CORRECTION else aligned
     cropped = crop_page(corrected) if ENABLE_CROP else corrected
     dewarped = dewarp_page(cropped) if ENABLE_DEWARP else cropped
     normalized = (
@@ -382,6 +487,8 @@ def main() -> None:
             if image is None:
                 logging.error("Failed to read image: %s", image_path)
                 continue
+
+            image = align_book_image(image)
 
             pages = [image]
             if is_double_page(image):
