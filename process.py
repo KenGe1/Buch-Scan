@@ -29,7 +29,7 @@ PNG_COMPRESSION = 3
 
 ENABLE_PERSPECTIVE_CORRECTION = True
 ENABLE_CROP = True
-ENABLE_DEWARP = False
+ENABLE_DEWARP = True
 ENABLE_LIGHTING_NORMALIZATION = False
 
 
@@ -96,36 +96,66 @@ def build_page_mask(image: np.ndarray) -> np.ndarray:
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return mask
-
-    # Keep the largest connected component as book/object region.
-    largest = max(contours, key=cv2.contourArea)
-    out = np.zeros_like(mask)
-    cv2.drawContours(out, [largest], -1, 255, thickness=cv2.FILLED)
-    return out
+    # Keep all cleaned components. The final page selection uses shape scoring,
+    # which is more robust than always taking the largest blob.
+    return mask
 
 
-def detect_book_region(mask: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
-    """Return the main book contour and a padded bounding box from a foreground mask."""
+def _page_shape_score(contour: np.ndarray, image_h: int, image_w: int) -> float:
+    """Score how likely a contour is a full page/book region (higher is better)."""
+    area = cv2.contourArea(contour)
+    if area <= 1:
+        return -1.0
+
+    x, y, bw, bh = cv2.boundingRect(contour)
+    rect_area = float(max(1, bw * bh))
+    area_ratio = area / float(image_h * image_w)
+    fill_ratio = area / rect_area
+    aspect = bw / float(max(1, bh))
+
+    # Page-like contours should have significant area, be reasonably rectangular,
+    # and usually extend low in the image (useful against chapter-heading/text blobs).
+    aspect_score = max(0.0, 1.0 - min(abs(aspect - 0.75), abs(aspect - 1.4)) / 1.4)
+    bottom_reach = (y + bh) / float(max(1, image_h))
+
+    return (
+        2.6 * area_ratio
+        + 0.9 * fill_ratio
+        + 0.45 * aspect_score
+        + 0.35 * bottom_reach
+    )
+
+
+def _select_best_page_contour(mask: np.ndarray) -> Optional[np.ndarray]:
+    """Select the most page-like contour from the cleaned mask."""
     h, w = mask.shape[:2]
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
 
-    contour = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(contour)
-    if area < h * w * 0.12:
+    min_area = h * w * 0.06
+    candidates = [c for c in contours if cv2.contourArea(c) >= min_area]
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda c: _page_shape_score(c, h, w))
+
+
+def detect_book_region(mask: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
+    """Return the most likely page/book contour and a padded bounding box."""
+    h, w = mask.shape[:2]
+    contour = _select_best_page_contour(mask)
+    if contour is None:
         return None
 
     x, y, bw, bh = cv2.boundingRect(contour)
-    pad_x = max(10, int(bw * 0.02))
-    pad_y = max(10, int(bh * 0.02))
+    pad_x = max(12, int(bw * 0.025))
+    pad_y_top = max(10, int(bh * 0.02))
+    pad_y_bottom = max(18, int(bh * 0.055))
     x0 = max(0, x - pad_x)
-    y0 = max(0, y - pad_y)
+    y0 = max(0, y - pad_y_top)
     x1 = min(w, x + bw + pad_x)
-    y1 = min(h, y + bh + pad_y)
+    y1 = min(h, y + bh + pad_y_bottom)
 
     return contour, (x0, y0, x1, y1)
 
@@ -324,12 +354,8 @@ def find_page_contour(image: np.ndarray) -> Optional[np.ndarray]:
     mask = build_page_mask(image)
     h, w = mask.shape[:2]
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    contour = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(contour) < h * w * 0.2:
+    contour = _select_best_page_contour(mask)
+    if contour is None:
         return None
 
     peri = cv2.arcLength(contour, True)
@@ -363,13 +389,19 @@ def crop_page(image: np.ndarray) -> np.ndarray:
         return image
 
     x, y, w, h = cv2.boundingRect(c)
-    px = max(12, int(w * 0.018))
-    py = max(12, int(h * 0.02))
+    px = max(12, int(w * 0.02))
+    py_top = max(12, int(h * 0.02))
+    py_bottom = max(18, int(h * 0.07))
 
+    contour_bottom = int(np.percentile(c[:, 0, 1], 98))
     x0 = max(bx0, x - px)
-    y0 = max(by0, y - py)
+    y0 = max(by0, y - py_top)
     x1 = min(bx1, x + w + px)
-    y1 = min(by1, y + h + py)
+    y1 = min(by1, max(y + h + py_bottom, contour_bottom + py_bottom))
+
+    # Bottom safety: avoid common under-crop on the page footline.
+    min_bottom = by0 + int((by1 - by0) * 0.96)
+    y1 = max(y1, min(by1, min_bottom))
 
     return image[y0:y1, x0:x1]
 
@@ -404,19 +436,30 @@ def correct_perspective(image: np.ndarray) -> np.ndarray:
 
 
 def dewarp_page(image: np.ndarray) -> np.ndarray:
-    """Apply mild vertical dewarping to flatten book curvature near the gutter."""
+    """Apply adaptive vertical dewarping to flatten paper curvature near the gutter."""
     h, w = image.shape[:2]
-    if h < 300 or w < 300:
+    if h < 260 or w < 260:
         return image
 
-    y_coords, x_coords = np.indices((h, w), dtype=np.float32)
-    x_norm = (x_coords - (w / 2.0)) / (w / 2.0)
-    strength = 0.02
+    gray = preprocess_image(image)
+    col_mean = gray.mean(axis=0)
+    center = w // 2
+    search = max(20, int(w * 0.2))
+    s0, s1 = max(0, center - search), min(w, center + search)
+    if s1 - s0 < 12:
+        return image
 
-    y_offset = (x_norm**2) * strength * h
+    local = col_mean[s0:s1]
+    gutter_x = s0 + int(np.argmin(local))
+
+    # Stronger at sides, weaker at gutter. Strength adapts with image size.
+    y_coords, x_coords = np.indices((h, w), dtype=np.float32)
+    x_norm = np.abs((x_coords - gutter_x) / max(1.0, w / 2.0))
+    base_strength = np.clip(0.022 + (h / 3000.0), 0.02, 0.04)
+    y_offset = (x_norm**2) * base_strength * h
+
     map_x = x_coords
     map_y = np.clip(y_coords - y_offset, 0, h - 1)
-
     return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR)
 
 
