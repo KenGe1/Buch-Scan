@@ -32,9 +32,15 @@ Wenn die klassische Kontur-Erkennung bei deinen Fotos instabil ist, kannst du YO
    - `ENABLE_YOLO_PAGE_DETECTION = True`
    - `YOLO_MODEL_PATH` auf dein Modell (z. B. `"yolov8n.pt"` oder ein trainiertes Buchseiten-Modell)
    - Optional `YOLO_TARGET_CLASSES` (Standard: `["book"]`)
+   - Bei Fehl-Erkennungen zusätzlich diese Filter feinjustieren:
+     - `YOLO_MIN_AREA_RATIO` (größere Werte filtern kleine/illustrationsartige Boxen)
+     - `YOLO_MIN_MASK_COVERAGE` (größere Werte erzwingen bessere Übereinstimmung mit der Seitenmaske)
+     - `YOLO_MIN_SIDE_RATIO` (filtern schmale Streifen)
 2. Danach läuft die Pipeline so:
    - YOLO erkennt zuerst Buch-/Seitenbereich
-   - Cropping, Perspective, Dewarping nutzen diese robustere Region
+   - Die Erkennung wird zusätzlich mit der vorhandenen Seitenmaske validiert (gegen schmale Fremdbereiche/Illustrationen)
+   - Wenn YOLO und OpenCV stark widersprechen, gewinnt automatisch die stabilere OpenCV-Region
+   - Cropping, Perspective, Dewarping nutzen die final gewählte robuste Region
    - Falls YOLO nicht verfügbar ist oder nichts findet, wird automatisch auf die bisherige OpenCV-Logik zurückgefallen
 
 Für beste Ergebnisse solltest du ein eigenes Modell auf Buchseiten trainieren (Label z. B. `page` oder `book_page`) und dann `YOLO_TARGET_CLASSES` entsprechend anpassen.

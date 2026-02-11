@@ -38,6 +38,10 @@ YOLO_MODEL_PATH = "yolov8n.pt"  # Can also be a custom page detector model.
 YOLO_CONFIDENCE = 0.25
 YOLO_IOU = 0.45
 YOLO_TARGET_CLASSES: Optional[List[str]] = ["book"]
+YOLO_MIN_AREA_RATIO = 0.16
+YOLO_MIN_SIDE_RATIO = 0.22
+YOLO_MIN_MASK_COVERAGE = 0.45
+YOLO_CENTER_WEIGHT = 0.20
 
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -69,8 +73,36 @@ def _get_yolo_model():
     return _YOLO_MODEL
 
 
-def _detect_book_region_yolo(image: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
-    """Detect the primary page/book box with YOLO and return contour + padded bbox."""
+def _bbox_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+    """Intersection-over-union between two x0,y0,x1,y1 boxes."""
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
+    inter = float(iw * ih)
+    if inter <= 0.0:
+        return 0.0
+    area_a = float(max(1, (ax1 - ax0) * (ay1 - ay0)))
+    area_b = float(max(1, (bx1 - bx0) * (by1 - by0)))
+    return inter / max(1e-6, area_a + area_b - inter)
+
+
+def _mask_coverage(mask: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
+    """How much of the bbox is supported by the page mask."""
+    x0, y0, x1, y1 = bbox
+    roi = mask[y0:y1, x0:x1]
+    if roi.size == 0:
+        return 0.0
+    return float((roi > 0).mean())
+
+
+def _detect_book_region_yolo(
+    image: np.ndarray,
+    mask: np.ndarray,
+    expected_bbox: Optional[Tuple[int, int, int, int]] = None,
+) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
+    """Detect primary page/book box with YOLO, filtered by geometry and mask agreement."""
     model = _get_yolo_model()
     if model is None:
         return None
@@ -86,17 +118,15 @@ def _detect_book_region_yolo(image: np.ndarray) -> Optional[Tuple[np.ndarray, Tu
 
     names = getattr(result, "names", {}) or {}
     h, w = image.shape[:2]
+    allowed = {name.lower() for name in YOLO_TARGET_CLASSES} if YOLO_TARGET_CLASSES else None
 
-    best = None
+    best_box: Optional[Tuple[int, int, int, int]] = None
     best_score = -1.0
     for box in result.boxes:
         cls_idx = int(box.cls[0].item()) if box.cls is not None else -1
         cls_name = str(names.get(cls_idx, "")).lower()
-
-        if YOLO_TARGET_CLASSES:
-            allowed = {name.lower() for name in YOLO_TARGET_CLASSES}
-            if cls_name and cls_name not in allowed:
-                continue
+        if allowed and cls_name and cls_name not in allowed:
+            continue
 
         x0, y0, x1, y1 = box.xyxy[0].cpu().numpy().tolist()
         x0, y0 = int(max(0, x0)), int(max(0, y0))
@@ -106,20 +136,40 @@ def _detect_book_region_yolo(image: np.ndarray) -> Optional[Tuple[np.ndarray, Tu
             continue
 
         area_ratio = (bw * bh) / float(max(1, h * w))
+        if area_ratio < YOLO_MIN_AREA_RATIO:
+            continue
+        if bw < int(w * YOLO_MIN_SIDE_RATIO) or bh < int(h * YOLO_MIN_SIDE_RATIO):
+            continue
+
+        aspect = bw / float(max(1, bh))
+        if aspect > 2.25 or aspect < 0.38:
+            continue
+
+        candidate = (x0, y0, x1, y1)
+        coverage = _mask_coverage(mask, candidate)
+        if coverage < YOLO_MIN_MASK_COVERAGE:
+            continue
+
         conf = float(box.conf[0].item()) if box.conf is not None else 0.0
-        score = (conf * 0.65) + (area_ratio * 0.35)
+        center_x = (x0 + x1) / 2.0
+        center_bias = 1.0 - abs(center_x - (w / 2.0)) / max(1.0, (w / 2.0))
+        score = (conf * 0.50) + (area_ratio * 0.20) + (coverage * 0.30) + (YOLO_CENTER_WEIGHT * center_bias)
+
+        if expected_bbox is not None:
+            score += 0.35 * _bbox_iou(candidate, expected_bbox)
+
         if score > best_score:
             best_score = score
-            best = (x0, y0, x1, y1)
+            best_box = candidate
 
-    if best is None:
+    if best_box is None:
         return None
 
-    x0, y0, x1, y1 = best
+    x0, y0, x1, y1 = best_box
     bw, bh = x1 - x0, y1 - y0
-    pad_x = max(12, int(bw * 0.025))
-    pad_y_top = max(10, int(bh * 0.02))
-    pad_y_bottom = max(18, int(bh * 0.055))
+    pad_x = max(12, int(bw * 0.02))
+    pad_y_top = max(10, int(bh * 0.018))
+    pad_y_bottom = max(18, int(bh * 0.05))
 
     x0 = max(0, x0 - pad_x)
     y0 = max(0, y0 - pad_y_top)
@@ -309,14 +359,28 @@ def detect_book_region(mask: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int
 
 
 def detect_book_region_from_image(image: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
-    """Detect main page/book region; YOLO first (optional), then contour fallback."""
-    if ENABLE_YOLO_PAGE_DETECTION:
-        yolo_region = _detect_book_region_yolo(image)
-        if yolo_region is not None:
-            return yolo_region
-
+    """Detect main page/book region using a robust fusion of contour + optional YOLO."""
     mask = build_page_mask(image)
-    return detect_book_region(mask)
+    contour_region = detect_book_region(mask)
+
+    if not ENABLE_YOLO_PAGE_DETECTION:
+        return contour_region
+
+    expected_bbox = contour_region[1] if contour_region is not None else None
+    yolo_region = _detect_book_region_yolo(image, mask, expected_bbox=expected_bbox)
+    if yolo_region is None:
+        return contour_region
+
+    if contour_region is None:
+        return yolo_region
+
+    _, yolo_bbox = yolo_region
+    _, contour_bbox = contour_region
+    # If YOLO strongly disagrees with mask-based detection, keep the contour region.
+    if _bbox_iou(yolo_bbox, contour_bbox) < 0.24 and _mask_coverage(mask, yolo_bbox) < 0.58:
+        return contour_region
+
+    return yolo_region
 
 
 def _rotation_from_contour(contour: np.ndarray) -> float:
@@ -508,9 +572,9 @@ def order_points(pts: np.ndarray) -> np.ndarray:
 def find_page_contour(image: np.ndarray) -> Optional[np.ndarray]:
     """Find a robust page contour and return a quadrilateral if possible."""
     if ENABLE_YOLO_PAGE_DETECTION:
-        yolo_region = _detect_book_region_yolo(image)
-        if yolo_region is not None:
-            _, (x0, y0, x1, y1) = yolo_region
+        region = detect_book_region_from_image(image)
+        if region is not None:
+            _, (x0, y0, x1, y1) = region
             return np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
 
     mask = build_page_mask(image)
