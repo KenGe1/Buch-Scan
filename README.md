@@ -47,3 +47,8 @@ Wenn die klassische Kontur-Erkennung bei deinen Fotos instabil ist, kannst du YO
    - Falls YOLO nicht verfügbar ist oder nichts findet, wird automatisch auf die bisherige OpenCV-Logik zurückgefallen
 
 Für beste Ergebnisse solltest du ein eigenes Modell auf Buchseiten trainieren (Label z. B. `page` oder `book_page`) und dann `YOLO_TARGET_CLASSES` entsprechend anpassen.
+
+
+## Performance-Hinweis
+Wenn die Verarbeitung zu langsam ist, kannst du in `process.py` `ENABLE_GLOBAL_ALIGNMENT = False` setzen.
+Das deaktiviert die globale Rotations-Ausrichtung des kompletten Bildes und spart Rechenzeit, besonders bei großen Bildern.

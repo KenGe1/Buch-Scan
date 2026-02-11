@@ -31,6 +31,7 @@ ENABLE_PERSPECTIVE_CORRECTION = True
 ENABLE_CROP = True
 ENABLE_DEWARP = True
 ENABLE_LIGHTING_NORMALIZATION = False
+ENABLE_GLOBAL_ALIGNMENT = True
 
 # Optional YOLO-based page detection (recommended for unstable contour detections).
 ENABLE_YOLO_PAGE_DETECTION = False
@@ -522,6 +523,9 @@ def rotate_image(image: np.ndarray, angle: float) -> np.ndarray:
 
 def align_book_image(image: np.ndarray) -> np.ndarray:
     """Globally align the entire book before split/crop/warp operations."""
+    if not ENABLE_GLOBAL_ALIGNMENT:
+        return image
+
     region = detect_book_region_from_image(image)
     if region is None:
         return image
@@ -628,11 +632,12 @@ def is_double_page(image: np.ndarray) -> bool:
 
     seam_x, seam_conf = find_split_line(image)
     has_center_seam = seam_conf > 0.10 and int(w * 0.22) < seam_x < int(w * 0.78)
+    if has_center_seam:
+        return True
 
+    # Expensive fallback only when seam signal is weak/ambiguous.
     boxes = detect_page_boxes(image)
-    has_two_boxes = len(boxes) == 2
-
-    return has_center_seam or has_two_boxes
+    return len(boxes) == 2
 
 
 def split_double_page(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -840,9 +845,9 @@ def save_pages_as_pdf(images: List[np.ndarray], output_dir: Path, filename: str)
     first_page.save(pdf_path, save_all=True, append_images=pil_pages[1:])
     logging.info("Saved %s", pdf_path)
 
-def process_page(image: np.ndarray) -> np.ndarray:
+def process_page(image: np.ndarray, *, already_aligned: bool = False) -> np.ndarray:
     """Process a single page through crop, perspective correction, dewarp, and lighting."""
-    aligned = align_book_image(image)
+    aligned = image if already_aligned else align_book_image(image)
     corrected = correct_perspective(aligned) if ENABLE_PERSPECTIVE_CORRECTION else aligned
     cropped = crop_page(corrected) if ENABLE_CROP else corrected
     dewarped = dewarp_page(cropped) if ENABLE_DEWARP else cropped
@@ -869,8 +874,8 @@ def main() -> None:
                 logging.error("Failed to read image: %s", image_path)
                 continue
 
-            image = align_book_image(image)
-
+            # Keep split detection on original image for speed; each output page
+            # is aligned once in process_page().
             pages = [image]
             if is_double_page(image):
                 pages = list(split_double_page(image))
