@@ -32,8 +32,105 @@ ENABLE_CROP = True
 ENABLE_DEWARP = True
 ENABLE_LIGHTING_NORMALIZATION = False
 
+# Optional YOLO-based page detection (recommended for unstable contour detections).
+ENABLE_YOLO_PAGE_DETECTION = False
+YOLO_MODEL_PATH = "yolov8n.pt"  # Can also be a custom page detector model.
+YOLO_CONFIDENCE = 0.25
+YOLO_IOU = 0.45
+YOLO_TARGET_CLASSES: Optional[List[str]] = ["book"]
+
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+
+_YOLO_MODEL = None
+_YOLO_LOAD_ATTEMPTED = False
+
+
+def _get_yolo_model():
+    """Lazy-load an Ultralytics YOLO model if enabled and available."""
+    global _YOLO_MODEL, _YOLO_LOAD_ATTEMPTED
+    if not ENABLE_YOLO_PAGE_DETECTION:
+        return None
+    if _YOLO_MODEL is not None:
+        return _YOLO_MODEL
+    if _YOLO_LOAD_ATTEMPTED:
+        return None
+
+    _YOLO_LOAD_ATTEMPTED = True
+    try:
+        from ultralytics import YOLO  # type: ignore
+
+        _YOLO_MODEL = YOLO(YOLO_MODEL_PATH)
+        logging.info("Loaded YOLO model: %s", YOLO_MODEL_PATH)
+    except Exception as exc:
+        logging.warning("YOLO page detection disabled (load failed): %s", exc)
+        _YOLO_MODEL = None
+    return _YOLO_MODEL
+
+
+def _detect_book_region_yolo(image: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
+    """Detect the primary page/book box with YOLO and return contour + padded bbox."""
+    model = _get_yolo_model()
+    if model is None:
+        return None
+
+    try:
+        result = model.predict(image, conf=YOLO_CONFIDENCE, iou=YOLO_IOU, verbose=False)[0]
+    except Exception as exc:
+        logging.warning("YOLO inference failed, using contour fallback: %s", exc)
+        return None
+
+    if result.boxes is None or len(result.boxes) == 0:
+        return None
+
+    names = getattr(result, "names", {}) or {}
+    h, w = image.shape[:2]
+
+    best = None
+    best_score = -1.0
+    for box in result.boxes:
+        cls_idx = int(box.cls[0].item()) if box.cls is not None else -1
+        cls_name = str(names.get(cls_idx, "")).lower()
+
+        if YOLO_TARGET_CLASSES:
+            allowed = {name.lower() for name in YOLO_TARGET_CLASSES}
+            if cls_name and cls_name not in allowed:
+                continue
+
+        x0, y0, x1, y1 = box.xyxy[0].cpu().numpy().tolist()
+        x0, y0 = int(max(0, x0)), int(max(0, y0))
+        x1, y1 = int(min(w, x1)), int(min(h, y1))
+        bw, bh = x1 - x0, y1 - y0
+        if bw <= 0 or bh <= 0:
+            continue
+
+        area_ratio = (bw * bh) / float(max(1, h * w))
+        conf = float(box.conf[0].item()) if box.conf is not None else 0.0
+        score = (conf * 0.65) + (area_ratio * 0.35)
+        if score > best_score:
+            best_score = score
+            best = (x0, y0, x1, y1)
+
+    if best is None:
+        return None
+
+    x0, y0, x1, y1 = best
+    bw, bh = x1 - x0, y1 - y0
+    pad_x = max(12, int(bw * 0.025))
+    pad_y_top = max(10, int(bh * 0.02))
+    pad_y_bottom = max(18, int(bh * 0.055))
+
+    x0 = max(0, x0 - pad_x)
+    y0 = max(0, y0 - pad_y_top)
+    x1 = min(w, x1 + pad_x)
+    y1 = min(h, y1 + pad_y_bottom)
+
+    contour = np.array(
+        [[[x0, y0]], [[x1, y0]], [[x1, y1]], [[x0, y1]]],
+        dtype=np.int32,
+    )
+    return contour, (x0, y0, x1, y1)
 
 
 def load_images(input_dir: Path) -> List[Path]:
@@ -211,6 +308,17 @@ def detect_book_region(mask: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int
     return contour, (x0, y0, x1, y1)
 
 
+def detect_book_region_from_image(image: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
+    """Detect main page/book region; YOLO first (optional), then contour fallback."""
+    if ENABLE_YOLO_PAGE_DETECTION:
+        yolo_region = _detect_book_region_yolo(image)
+        if yolo_region is not None:
+            return yolo_region
+
+    mask = build_page_mask(image)
+    return detect_book_region(mask)
+
+
 def _rotation_from_contour(contour: np.ndarray) -> float:
     """Estimate small deskew angle (degrees) from the full book contour."""
     rect = cv2.minAreaRect(contour)
@@ -252,8 +360,7 @@ def rotate_image(image: np.ndarray, angle: float) -> np.ndarray:
 
 def align_book_image(image: np.ndarray) -> np.ndarray:
     """Globally align the entire book before split/crop/warp operations."""
-    mask = build_page_mask(image)
-    region = detect_book_region(mask)
+    region = detect_book_region_from_image(image)
     if region is None:
         return image
 
@@ -272,7 +379,7 @@ def detect_page_boxes(image: np.ndarray) -> List[Tuple[int, int, int, int]]:
     mask = build_page_mask(image)
     h, w = mask.shape[:2]
 
-    region = detect_book_region(mask)
+    region = detect_book_region_from_image(image)
     if region is None:
         return []
 
@@ -312,8 +419,7 @@ def find_split_line(image: np.ndarray) -> Tuple[int, float]:
     gray = preprocess_image(image)
     h, w = gray.shape[:2]
 
-    mask = build_page_mask(image)
-    region = detect_book_region(mask)
+    region = detect_book_region_from_image(image)
     if region is not None:
         _, (bx0, _, bx1, _) = region
         center = (bx0 + bx1) // 2
@@ -371,8 +477,7 @@ def split_double_page(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Split a double-page image into left and right pages with overlap safety."""
     h, w = image.shape[:2]
     seam_x, _ = find_split_line(image)
-    mask = build_page_mask(image)
-    region = detect_book_region(mask)
+    region = detect_book_region_from_image(image)
     if region is not None:
         _, (bx0, _, bx1, _) = region
         seam_x = int(np.clip(seam_x, bx0 + int((bx1 - bx0) * 0.2), bx1 - int((bx1 - bx0) * 0.2)))
@@ -402,6 +507,12 @@ def order_points(pts: np.ndarray) -> np.ndarray:
 
 def find_page_contour(image: np.ndarray) -> Optional[np.ndarray]:
     """Find a robust page contour and return a quadrilateral if possible."""
+    if ENABLE_YOLO_PAGE_DETECTION:
+        yolo_region = _detect_book_region_yolo(image)
+        if yolo_region is not None:
+            _, (x0, y0, x1, y1) = yolo_region
+            return np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+
     mask = build_page_mask(image)
     h, w = mask.shape[:2]
 
@@ -429,8 +540,7 @@ def find_page_contour(image: np.ndarray) -> Optional[np.ndarray]:
 
 def crop_page(image: np.ndarray) -> np.ndarray:
     """Crop image to the primary page region while preserving borders."""
-    mask = build_page_mask(image)
-    region = detect_book_region(mask)
+    region = detect_book_region_from_image(image)
     if region is None:
         return image
 

@@ -16,7 +16,7 @@ Ein kleines Python-Skript, das Buchfotos automatisch in saubere Seiten umwandelt
    - `True`: Alle Seiten in der richtigen Reihenfolge in `PDF_FILENAME` als eine PDF
 3. Benötigte Pakete installieren:
    ```bash
-   pip install opencv-python numpy pillow
+   pip install opencv-python numpy pillow ultralytics
    ```
 4. Script starten:
    ```bash
@@ -24,3 +24,17 @@ Ein kleines Python-Skript, das Buchfotos automatisch in saubere Seiten umwandelt
    ```
 
 Die fertigen Seiten werden im `OUTPUT_DIR` gespeichert.
+
+## YOLO für stabilere Seitenerkennung (optional)
+Wenn die klassische Kontur-Erkennung bei deinen Fotos instabil ist, kannst du YOLO aktivieren:
+
+1. In `process.py` diese Optionen setzen:
+   - `ENABLE_YOLO_PAGE_DETECTION = True`
+   - `YOLO_MODEL_PATH` auf dein Modell (z. B. `"yolov8n.pt"` oder ein trainiertes Buchseiten-Modell)
+   - Optional `YOLO_TARGET_CLASSES` (Standard: `["book"]`)
+2. Danach läuft die Pipeline so:
+   - YOLO erkennt zuerst Buch-/Seitenbereich
+   - Cropping, Perspective, Dewarping nutzen diese robustere Region
+   - Falls YOLO nicht verfügbar ist oder nichts findet, wird automatisch auf die bisherige OpenCV-Logik zurückgefallen
+
+Für beste Ergebnisse solltest du ein eigenes Modell auf Buchseiten trainieren (Label z. B. `page` oder `book_page`) und dann `YOLO_TARGET_CLASSES` entsprechend anpassen.
