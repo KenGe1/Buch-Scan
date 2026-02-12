@@ -12,8 +12,10 @@ Requirements:
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
-from typing import List, Optional, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -27,6 +29,8 @@ JPEG_QUALITY = 60  # normaler/empfohlener Wert: 80-90 | verlustreich (lossy)
 PDF_IMAGE_QUALITY = 75  # normaler/empfohlener Wert: 70-85 | verlustreich (lossy)
 PDF_RESOLUTION_DPI = 200  # normaler/empfohlener Wert: 150-250 | verlustreich bei Reduktion
 PDF_SOURCE_DPI = 300  # normaler/empfohlener Wert: 300 | Referenz-DPI für PDF-Downscaling
+USE_MULTIPROCESSING = False
+MULTIPROCESSING_CORES = 4
 
 ENABLE_PERSPECTIVE_CORRECTION = True
 ENABLE_CROP = True
@@ -861,6 +865,51 @@ def process_page(image: np.ndarray) -> np.ndarray:
     return dewarped
 
 
+def _split_into_batches(items: Sequence[Tuple[int, Path]], batch_count: int) -> List[List[Tuple[int, Path]]]:
+    """Split indexed image paths into contiguous batches."""
+    if not items:
+        return []
+    batch_count = max(1, min(batch_count, len(items)))
+    batch_size = max(1, math.ceil(len(items) / batch_count))
+    return [list(items[i : i + batch_size]) for i in range(0, len(items), batch_size)]
+
+
+def _process_single_image(image_idx: int, image_path: Path) -> List[Tuple[int, int, np.ndarray]]:
+    """Process one input image and return ordered page results."""
+    try:
+        image = cv2.imread(str(image_path))
+        if image is None:
+            logging.error("Failed to read image: %s", image_path)
+            return []
+
+        pages = [image]
+        if is_double_page(image):
+            pages = list(split_double_page(image))
+
+        results: List[Tuple[int, int, np.ndarray]] = []
+        for page_idx, page in enumerate(pages):
+            processed = process_page(page)
+            if processed.size == 0:
+                logging.warning("Skipping empty result for %s", image_path)
+                continue
+            results.append((image_idx, page_idx, processed))
+        return results
+
+    except Exception as exc:
+        logging.exception("Error processing %s: %s", image_path, exc)
+        return []
+
+
+def _process_batch(batch: Sequence[Tuple[int, str]]) -> List[Tuple[int, int, np.ndarray]]:
+    """Worker entrypoint for multiprocessing batches."""
+    batch_results: List[Tuple[int, int, np.ndarray]] = []
+    for image_idx, image_path_str in batch:
+        image_path = Path(image_path_str)
+        logging.info("Processing %s", image_path)
+        batch_results.extend(_process_single_image(image_idx, image_path))
+    return batch_results
+
+
 def main() -> None:
     """Entry point for batch processing."""
     image_paths = load_images(INPUT_DIR)
@@ -868,37 +917,41 @@ def main() -> None:
         logging.error("No images to process.")
         return
 
-    page_index = 1
-    processed_pages: List[np.ndarray] = []
-    for image_path in image_paths:
-        logging.info("Processing %s", image_path)
-        try:
-            image = cv2.imread(str(image_path))
-            if image is None:
-                logging.error("Failed to read image: %s", image_path)
-                continue
+    indexed_paths = list(enumerate(image_paths))
+    ordered_pages: List[Tuple[int, int, np.ndarray]] = []
 
-            # Keep split detection on original image for speed before page processing.
-            pages = [image]
-            if is_double_page(image):
-                pages = list(split_double_page(image))
+    use_mp = USE_MULTIPROCESSING and len(image_paths) > 1
+    workers = max(1, min(int(MULTIPROCESSING_CORES), len(image_paths)))
 
-            for page in pages:
-                processed = process_page(page)
-                if processed.size == 0:
-                    logging.warning("Skipping empty result for %s", image_path)
-                    continue
-                if OUTPUT_AS_PDF:
-                    processed_pages.append(processed)
-                else:
-                    save_page(processed, OUTPUT_DIR, page_index)
-                page_index += 1
+    if use_mp and workers > 1:
+        batches = _split_into_batches(indexed_paths, workers)
+        serialized_batches = [[(idx, str(path)) for idx, path in batch] for batch in batches]
+        logging.info(
+            "Multiprocessing enabled: %d worker(s), %d batch(es), ~%d image(s) per batch.",
+            workers,
+            len(serialized_batches),
+            math.ceil(len(image_paths) / len(serialized_batches)),
+        )
 
-        except Exception as exc:
-            logging.exception("Error processing %s: %s", image_path, exc)
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_process_batch, batch) for batch in serialized_batches]
+            for future in as_completed(futures):
+                ordered_pages.extend(future.result())
+    else:
+        if USE_MULTIPROCESSING and workers <= 1:
+            logging.info("Multiprocessing skipped because only one worker is available.")
+        for image_idx, image_path in indexed_paths:
+            logging.info("Processing %s", image_path)
+            ordered_pages.extend(_process_single_image(image_idx, image_path))
+
+    ordered_pages.sort(key=lambda item: (item[0], item[1]))
 
     if OUTPUT_AS_PDF:
-        save_pages_as_pdf(processed_pages, OUTPUT_DIR, PDF_FILENAME)
+        save_pages_as_pdf([page for _, _, page in ordered_pages], OUTPUT_DIR, PDF_FILENAME)
+        return
+
+    for page_index, (_, _, page_image) in enumerate(ordered_pages, start=1):
+        save_page(page_image, OUTPUT_DIR, page_index)
 
 
 if __name__ == "__main__":
