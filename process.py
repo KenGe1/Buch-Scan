@@ -42,6 +42,8 @@ YOLO_TARGET_CLASSES: Optional[List[str]] = ["book"]
 YOLO_MIN_AREA_RATIO = 0.30
 YOLO_MIN_SIDE_RATIO = 0.35
 YOLO_MIN_MASK_COVERAGE = 0.60
+# Weight for preferring detections that cover the image center column.
+# This is more robust than relying only on the YOLO box midpoint.
 YOLO_CENTER_WEIGHT = 0.70
 YOLO_MIN_RELATIVE_TO_CONTOUR = 0.75
 YOLO_MASTER_MODE = True
@@ -100,6 +102,25 @@ def _mask_coverage(mask: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
     if roi.size == 0:
         return 0.0
     return float((roi > 0).mean())
+
+
+def _center_column_bias(bbox: Tuple[int, int, int, int], image_w: int) -> float:
+    """Score how well bbox aligns with the global image center column (0..1)."""
+    x0, _, x1, _ = bbox
+    image_center_x = image_w / 2.0
+
+    # Strong prior: best if the actual image center lies inside the detection box.
+    center_inside = 1.0 if x0 <= image_center_x <= x1 else 0.0
+
+    # Smooth fallback: if not inside, prefer boxes close to image center.
+    if center_inside > 0.0:
+        distance_score = 1.0
+    else:
+        edge_distance = min(abs(image_center_x - x0), abs(image_center_x - x1))
+        distance_score = max(0.0, 1.0 - (edge_distance / max(1.0, image_w / 2.0)))
+
+    # "center_inside" dominates; distance_score helps when no candidate covers center.
+    return 0.85 * center_inside + 0.15 * distance_score
 
 
 
@@ -214,9 +235,13 @@ def _detect_book_region_yolo(
             continue
 
         conf = float(box.conf[0].item()) if box.conf is not None else 0.0
-        center_x = (x0 + x1) / 2.0
-        center_bias = 1.0 - abs(center_x - (w / 2.0)) / max(1.0, (w / 2.0))
-        score = (conf * 0.50) + (area_ratio * 0.20) + (coverage * 0.30) + (YOLO_CENTER_WEIGHT * center_bias)
+        center_bias = _center_column_bias(candidate, w)
+        score = (
+            (conf * 0.50)
+            + (area_ratio * 0.20)
+            + (coverage * 0.30)
+            + (YOLO_CENTER_WEIGHT * center_bias)
+        )
 
         if expected_bbox is not None:
             score += 0.35 * _bbox_iou(candidate, expected_bbox)
