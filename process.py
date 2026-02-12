@@ -21,11 +21,9 @@ from PIL import Image
 
 INPUT_DIR = Path(r"C:\Users\Kevin\OneDrive\Desktop\Buch test input")
 OUTPUT_DIR = Path(r"C:\Users\Kevin\OneDrive\Desktop\Buch test input\Buch test Output")
-OUTPUT_AS_PDF = True
+OUTPUT_AS_PDF = False
 PDF_FILENAME = "book_scan2.pdf"
-OUTPUT_FORMAT = "jpg"  # "jpg" or "png"
 JPEG_QUALITY = 60  # normaler/empfohlener Wert: 80-90 | verlustreich (lossy)
-PNG_COMPRESSION = 4  # normaler/empfohlener Wert: 4-7 | verlustfrei (lossless)
 PDF_IMAGE_QUALITY = 75  # normaler/empfohlener Wert: 70-85 | verlustreich (lossy)
 PDF_RESOLUTION_DPI = 200  # normaler/empfohlener Wert: 150-250 | verlustreich bei Reduktion
 PDF_SOURCE_DPI = 300  # normaler/empfohlener Wert: 300 | Referenz-DPI für PDF-Downscaling
@@ -34,8 +32,6 @@ ENABLE_PERSPECTIVE_CORRECTION = True
 ENABLE_CROP = True
 ENABLE_DEWARP = True
 DEWARP_THRESHOLD = 50
-ENABLE_LIGHTING_NORMALIZATION = False
-ENABLE_GLOBAL_ALIGNMENT = False
 
 # Optional YOLO-based page detection (recommended for unstable contour detections).
 ENABLE_YOLO_PAGE_DETECTION = True
@@ -516,64 +512,6 @@ def detect_book_region_from_image(image: np.ndarray) -> Optional[Tuple[np.ndarra
     return contour, yolo_bbox
 
 
-def _rotation_from_contour(contour: np.ndarray) -> float:
-    """Estimate small deskew angle (degrees) from the full book contour."""
-    rect = cv2.minAreaRect(contour)
-    (_, _), (rw, rh), angle = rect
-
-    if rw < 1 or rh < 1:
-        return 0.0
-
-    # OpenCV angle is in [-90, 0): normalize to a small correction around 0.
-    if rw < rh:
-        angle = angle + 90.0
-    if angle > 45:
-        angle -= 90
-    if angle < -45:
-        angle += 90
-
-    return float(np.clip(angle, -20.0, 20.0))
-
-
-def rotate_image(image: np.ndarray, angle: float) -> np.ndarray:
-    """Rotate image around center while preserving full canvas."""
-    if abs(angle) < 0.15:
-        return image
-
-    h, w = image.shape[:2]
-    center = (w / 2.0, h / 2.0)
-    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-
-    cos = abs(matrix[0, 0])
-    sin = abs(matrix[0, 1])
-    new_w = int((h * sin) + (w * cos))
-    new_h = int((h * cos) + (w * sin))
-
-    matrix[0, 2] += (new_w / 2.0) - center[0]
-    matrix[1, 2] += (new_h / 2.0) - center[1]
-
-    return cv2.warpAffine(image, matrix, (new_w, new_h), flags=cv2.INTER_CUBIC)
-
-
-def align_book_image(image: np.ndarray) -> np.ndarray:
-    """Globally align the entire book before split/crop/warp operations."""
-    if not ENABLE_GLOBAL_ALIGNMENT:
-        return image
-
-    region = detect_book_region_from_image(image)
-    if region is None:
-        return image
-
-    contour, _ = region
-    angle = _rotation_from_contour(contour)
-    if abs(angle) < 0.35:
-        return image
-
-    aligned = rotate_image(image, angle)
-    logging.debug("Applied global deskew: %.2f°", angle)
-    return aligned
-
-
 def detect_page_boxes(image: np.ndarray) -> List[Tuple[int, int, int, int]]:
     """Detect candidate page boxes sorted left-to-right."""
     mask = build_page_mask(image)
@@ -853,57 +791,19 @@ def dewarp_page(image: np.ndarray) -> np.ndarray:
     return cv2.warpPerspective(image, matrix, (max_width, max_height), flags=cv2.INTER_CUBIC)
 
 
-def normalize_lighting(image: np.ndarray) -> np.ndarray:
-    """Normalize lighting while preserving color for illustrations/photos."""
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-
-    illum = cv2.GaussianBlur(l, (0, 0), sigmaX=31)
-    l_corr = cv2.divide(l, illum, scale=220)
-
-    clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(8, 8))
-    l_corr = clahe.apply(l_corr)
-
-    merged = cv2.merge((l_corr, a, b))
-    color_out = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
-    color_out = cv2.bilateralFilter(color_out, d=5, sigmaColor=30, sigmaSpace=30)
-
-    return color_out
-
-
 def save_page(image: np.ndarray, output_dir: Path, index: int) -> None:
     """Save the processed page image with sequential naming."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    ext = OUTPUT_FORMAT.lower().strip(".")
-    filename = output_dir / f"page_{index:04d}.{ext}"
+    filename = output_dir / f"page_{index:04d}.jpg"
 
     try:
-        if ext in {"jpg", "jpeg"}:
-            ok = cv2.imwrite(
-                str(filename),
-                image,
-                [int(cv2.IMWRITE_JPEG_QUALITY), int(np.clip(JPEG_QUALITY, 0, 100))],
-            )
-            if not ok:
-                raise OSError("cv2.imwrite returned False")
-        elif ext == "png":
-            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            Image.fromarray(rgb_image).save(
-                filename,
-                format="PNG",
-                optimize=True,
-                compress_level=int(np.clip(PNG_COMPRESSION, 0, 9)),
-            )
-        else:
-            logging.warning("Unknown OUTPUT_FORMAT '%s', falling back to jpg.", OUTPUT_FORMAT)
-            filename = output_dir / f"page_{index:04d}.jpg"
-            ok = cv2.imwrite(
-                str(filename),
-                image,
-                [int(cv2.IMWRITE_JPEG_QUALITY), int(np.clip(JPEG_QUALITY, 0, 100))],
-            )
-            if not ok:
-                raise OSError("cv2.imwrite returned False")
+        ok = cv2.imwrite(
+            str(filename),
+            image,
+            [int(cv2.IMWRITE_JPEG_QUALITY), int(np.clip(JPEG_QUALITY, 0, 100))],
+        )
+        if not ok:
+            raise OSError("cv2.imwrite returned False")
 
     except Exception as exc:
         logging.error("Failed to save %s: %s", filename, exc)
@@ -952,16 +852,13 @@ def save_pages_as_pdf(images: List[np.ndarray], output_dir: Path, filename: str)
     )
     logging.info("Saved %s", pdf_path)
 
-def process_page(image: np.ndarray, *, already_aligned: bool = False) -> np.ndarray:
-    """Process a single page through crop, perspective correction, dewarp, and lighting."""
-    aligned = image if already_aligned else align_book_image(image)
-    corrected = correct_perspective(aligned) if ENABLE_PERSPECTIVE_CORRECTION else aligned
+
+def process_page(image: np.ndarray) -> np.ndarray:
+    """Process a single page through perspective correction, crop, and dewarp."""
+    corrected = correct_perspective(image) if ENABLE_PERSPECTIVE_CORRECTION else image
     cropped = crop_page(corrected) if ENABLE_CROP else corrected
     dewarped = dewarp_page(cropped) if ENABLE_DEWARP else cropped
-    normalized = (
-        normalize_lighting(dewarped) if ENABLE_LIGHTING_NORMALIZATION else dewarped
-    )
-    return normalized
+    return dewarped
 
 
 def main() -> None:
@@ -981,8 +878,7 @@ def main() -> None:
                 logging.error("Failed to read image: %s", image_path)
                 continue
 
-            # Keep split detection on original image for speed; each output page
-            # is aligned once in process_page().
+            # Keep split detection on original image for speed before page processing.
             pages = [image]
             if is_double_page(image):
                 pages = list(split_double_page(image))
