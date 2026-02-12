@@ -24,8 +24,10 @@ OUTPUT_DIR = Path(r"C:\Users\Kevin\OneDrive\Desktop\Buch test input\Buch test Ou
 OUTPUT_AS_PDF = False
 PDF_FILENAME = "book_scan.pdf"
 OUTPUT_FORMAT = "jpg"  # "jpg" or "png"
-JPEG_QUALITY = 80
-PNG_COMPRESSION = 5
+JPEG_QUALITY = 80  # normaler/empfohlener Wert: 80-90 | verlustreich (lossy)
+PNG_COMPRESSION = 6  # normaler/empfohlener Wert: 4-7 | verlustfrei (lossless)
+PDF_IMAGE_QUALITY = 75  # normaler/empfohlener Wert: 70-85 | verlustreich (lossy)
+PDF_RESOLUTION_DPI = 200  # normaler/empfohlener Wert: 150-250 | verlustreich bei Reduktion
 
 ENABLE_PERSPECTIVE_CORRECTION = True
 ENABLE_CROP = True
@@ -871,8 +873,34 @@ def normalize_lighting(image: np.ndarray) -> np.ndarray:
 def save_page(image: np.ndarray, output_dir: Path, index: int) -> None:
     """Save the processed page image with sequential naming."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    filename = output_dir / f"page_{index:04d}.{OUTPUT_FORMAT}"
-    cv2.imwrite(str(filename), image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    ext = OUTPUT_FORMAT.lower().strip(".")
+    filename = output_dir / f"page_{index:04d}.{ext}"
+
+    if ext in {"jpg", "jpeg"}:
+        ok = cv2.imwrite(
+            str(filename),
+            image,
+            [int(cv2.IMWRITE_JPEG_QUALITY), int(np.clip(JPEG_QUALITY, 0, 100))],
+        )
+    elif ext == "png":
+        ok = cv2.imwrite(
+            str(filename),
+            image,
+            [int(cv2.IMWRITE_PNG_COMPRESSION), int(np.clip(PNG_COMPRESSION, 0, 9))],
+        )
+    else:
+        logging.warning("Unknown OUTPUT_FORMAT '%s', falling back to jpg.", OUTPUT_FORMAT)
+        filename = output_dir / f"page_{index:04d}.jpg"
+        ok = cv2.imwrite(
+            str(filename),
+            image,
+            [int(cv2.IMWRITE_JPEG_QUALITY), int(np.clip(JPEG_QUALITY, 0, 100))],
+        )
+
+    if not ok:
+        logging.error("Failed to save %s", filename)
+        return
+
     logging.info("Saved %s", filename)
 
 def save_pages_as_pdf(images: List[np.ndarray], output_dir: Path, filename: str) -> None:
@@ -886,7 +914,14 @@ def save_pages_as_pdf(images: List[np.ndarray], output_dir: Path, filename: str)
 
     pil_pages = [Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)) for image in images]
     first_page = pil_pages[0]
-    first_page.save(pdf_path, save_all=True, append_images=pil_pages[1:])
+    first_page.save(
+        pdf_path,
+        save_all=True,
+        append_images=pil_pages[1:],
+        resolution=float(max(72, PDF_RESOLUTION_DPI)),
+        quality=int(np.clip(PDF_IMAGE_QUALITY, 1, 95)),
+        optimize=True,
+    )
     logging.info("Saved %s", pdf_path)
 
 def process_page(image: np.ndarray, *, already_aligned: bool = False) -> np.ndarray:
