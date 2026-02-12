@@ -26,13 +26,13 @@ from PIL import Image
 INPUT_DIR = Path(r"C:\Users\Kevin\OneDrive\Desktop\Buch test input")
 OUTPUT_DIR = Path(r"C:\Users\Kevin\OneDrive\Desktop\Buch test input\Buch test Output")
 OUTPUT_AS_PDF = True
-PDF_FILENAME = "book_scan2.pdf"
+PDF_FILENAME = "book_scan.pdf"
 JPEG_QUALITY = 60  # normaler/empfohlener Wert: 80-90 | verlustreich (lossy)
-PDF_IMAGE_QUALITY = 75  # normaler/empfohlener Wert: 70-85 | verlustreich (lossy)
+PDF_IMAGE_QUALITY = 80  # normaler/empfohlener Wert: 70-85 | verlustreich (lossy)
 PDF_RESOLUTION_DPI = 200  # normaler/empfohlener Wert: 150-250 | verlustreich bei Reduktion
 PDF_SOURCE_DPI = 300  # normaler/empfohlener Wert: 300 | Referenz-DPI für PDF-Downscaling
 USE_MULTIPROCESSING = True
-MULTIPROCESSING_CORES = 10 #es werden doppelt so viele kerne belastet wie hier angegeben 
+MULTIPROCESSING_CORES = 11 #es werden doppelt so viele kerne belastet wie hier angegeben 
 
 ENABLE_PERSPECTIVE_CORRECTION = True
 ENABLE_CROP = True
