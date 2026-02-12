@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import logging
 import math
+import multiprocessing
+import os
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Optional, Sequence, Tuple
@@ -67,6 +69,22 @@ _YOLO_MODEL = None
 _YOLO_LOAD_ATTEMPTED = False
 
 
+def _resolve_worker_count(total_images: int) -> int:
+    """Resolve usable worker count from config, image count, and CPU availability."""
+    requested = max(1, int(MULTIPROCESSING_CORES))
+    cpu_limit = max(1, (os.cpu_count() or 1))
+    workers = min(requested, cpu_limit, max(1, total_images))
+
+    if requested > cpu_limit:
+        logging.info("Requested %d cores, but only %d CPU core(s) are available.", requested, cpu_limit)
+    return workers
+
+
+def _worker_initializer() -> None:
+    """Initialize heavy worker resources once per process."""
+    _get_yolo_model()
+
+
 def _get_yolo_model():
     """Lazy-load an Ultralytics YOLO model if enabled and available."""
     global _YOLO_MODEL, _YOLO_LOAD_ATTEMPTED
@@ -82,7 +100,8 @@ def _get_yolo_model():
         from ultralytics import YOLO  # type: ignore
 
         _YOLO_MODEL = YOLO(YOLO_MODEL_PATH)
-        logging.info("Loaded YOLO model: %s", YOLO_MODEL_PATH)
+        if multiprocessing.current_process().name == "MainProcess":
+            logging.info("Loaded YOLO model: %s", YOLO_MODEL_PATH)
     except Exception as exc:
         logging.warning("YOLO page detection disabled (load failed): %s", exc)
         _YOLO_MODEL = None
@@ -921,7 +940,7 @@ def main() -> None:
     ordered_pages: List[Tuple[int, int, np.ndarray]] = []
 
     use_mp = USE_MULTIPROCESSING and len(image_paths) > 1
-    workers = max(1, min(int(MULTIPROCESSING_CORES), len(image_paths)))
+    workers = _resolve_worker_count(len(image_paths))
 
     if use_mp and workers > 1:
         batches = _split_into_batches(indexed_paths, workers)
@@ -933,7 +952,7 @@ def main() -> None:
             math.ceil(len(image_paths) / len(serialized_batches)),
         )
 
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        with ProcessPoolExecutor(max_workers=workers, initializer=_worker_initializer) as executor:
             futures = [executor.submit(_process_batch, batch) for batch in serialized_batches]
             for future in as_completed(futures):
                 ordered_pages.extend(future.result())
