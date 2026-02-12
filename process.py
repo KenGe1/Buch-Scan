@@ -48,6 +48,13 @@ YOLO_MASTER_MODE = True
 YOLO_MASTER_MIN_IOU_FOR_CONTOUR_EXPAND = 0.10
 YOLO_MASTER_MAX_CONTOUR_EXPAND = 0.13
 
+# Geometric priors to avoid false page detections on narrow illustrations/strips.
+DIN_A_ASPECT = np.sqrt(2.0)  # Height / width for DIN pages.
+PAGE_ASPECT_TARGETS = (1.0 / DIN_A_ASPECT, DIN_A_ASPECT)  # Portrait width/height, and spread.
+PAGE_ASPECT_TOLERANCE = 0.34  # ±34% relative tolerance for perspective + camera angle.
+PAGE_ASPECT_HARD_MIN = 0.42
+PAGE_ASPECT_HARD_MAX = 2.38
+
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
@@ -100,6 +107,22 @@ def _mask_coverage(mask: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
     if roi.size == 0:
         return 0.0
     return float((roi > 0).mean())
+
+
+def _aspect_distance_to_page_targets(aspect: float) -> float:
+    """Relative distance to nearest expected page aspect target (0 is best)."""
+    if aspect <= 0:
+        return 1e9
+    return min(abs(aspect - target) / target for target in PAGE_ASPECT_TARGETS)
+
+
+def _is_page_aspect_plausible(aspect: float, *, tolerance: float = PAGE_ASPECT_TOLERANCE) -> bool:
+    """Return True if aspect ratio is page-like under soft tolerance and hard bounds."""
+    if aspect <= 0:
+        return False
+    if aspect < PAGE_ASPECT_HARD_MIN or aspect > PAGE_ASPECT_HARD_MAX:
+        return False
+    return _aspect_distance_to_page_targets(aspect) <= tolerance
 
 
 
@@ -205,7 +228,7 @@ def _detect_book_region_yolo(
             continue
 
         aspect = bw / float(max(1, bh))
-        if aspect > 2.25 or aspect < 0.38:
+        if not _is_page_aspect_plausible(aspect, tolerance=PAGE_ASPECT_TOLERANCE + 0.10):
             continue
 
         candidate = (x0, y0, x1, y1)
@@ -305,7 +328,7 @@ def _filter_mask_components(mask: np.ndarray) -> np.ndarray:
         if bw < min_w or bh < min_h:
             continue
         aspect = bw / float(max(1, bh))
-        if aspect > 3.2 or aspect < 0.18:
+        if not _is_page_aspect_plausible(aspect, tolerance=PAGE_ASPECT_TOLERANCE + 0.14):
             continue
         cv2.drawContours(out, [c], -1, 255, thickness=cv2.FILLED)
 
@@ -361,12 +384,13 @@ def _page_shape_score(contour: np.ndarray, image_h: int, image_w: int) -> float:
 
     # Page-like contours should have significant area, be reasonably rectangular,
     # and usually extend low in the image (useful against chapter-heading/text blobs).
-    aspect_score = max(0.0, 1.0 - min(abs(aspect - 0.75), abs(aspect - 1.35)) / 1.35)
+    aspect_distance = _aspect_distance_to_page_targets(aspect)
+    aspect_score = max(0.0, 1.0 - (aspect_distance / max(PAGE_ASPECT_TOLERANCE, 1e-6)))
     bottom_reach = (y + bh) / float(max(1, image_h))
 
     # Penalize stripe-like detections.
     strip_penalty = 0.0
-    if aspect > 2.6 or aspect < 0.28:
+    if not _is_page_aspect_plausible(aspect, tolerance=PAGE_ASPECT_TOLERANCE + 0.30):
         strip_penalty = 0.6
 
     return (
@@ -393,6 +417,8 @@ def _select_best_page_contour(mask: np.ndarray) -> Optional[np.ndarray]:
             continue
         x, y, bw, bh = cv2.boundingRect(c)
         if bw < w * 0.22 or bh < h * 0.30:
+            continue
+        if not _is_page_aspect_plausible(bw / float(max(1, bh)), tolerance=PAGE_ASPECT_TOLERANCE + 0.12):
             continue
         candidates.append(c)
 
