@@ -795,46 +795,58 @@ def correct_perspective(image: np.ndarray) -> np.ndarray:
 
 
 def dewarp_page(image: np.ndarray) -> np.ndarray:
-    """Apply adaptive vertical dewarping to flatten paper curvature near the gutter."""
+    """Dewarp page by fitting a stable rotated page rectangle and warping to top view."""
     h, w = image.shape[:2]
-    if h < 260 or w < 260:
+    if h < 220 or w < 220:
         return image
 
-    gray = preprocess_image(image)
-    col_mean = gray.mean(axis=0)
-    center = w // 2
-    search = max(20, int(w * 0.2))
-    s0, s1 = max(0, center - search), min(w, center + search)
-    if s1 - s0 < 12:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, mask = cv2.threshold(blur, 70, 255, cv2.THRESH_BINARY)
+
+    kernel = np.ones((15, 15), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
         return image
 
-    local = col_mean[s0:s1]
-    gutter_x = s0 + int(np.argmin(local))
-
-    # Stronger at sides, weaker at gutter. Strength adapts with image size.
-    y_coords, x_coords = np.indices((h, w), dtype=np.float32)
-    x_norm = np.abs((x_coords - np.float32(gutter_x)) / np.float32(max(1.0, w / 2.0)))
-    base_strength = float(np.clip(0.022 + (h / 3000.0), 0.02, 0.04))
-    y_offset = (x_norm**2) * np.float32(base_strength * h)
-
-    map_x = np.ascontiguousarray(x_coords, dtype=np.float32)
-    map_y = np.ascontiguousarray(np.clip(y_coords - y_offset, 0, h - 1), dtype=np.float32)
-
-    # Build CV_32FC2 map explicitly; this avoids platform-specific map1/map2 typing issues.
-    map_xy = np.dstack((map_x, map_y)).astype(np.float32, copy=False)
-    map_xy = np.ascontiguousarray(map_xy)
-
-    try:
-        return cv2.remap(
-            image,
-            map_xy,
-            None,
-            interpolation=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REPLICATE,
-        )
-    except cv2.error:
-        # Safe fallback: keep pipeline running even if a local OpenCV build is picky.
+    page_contour = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(page_contour)
+    if area < (h * w * 0.30):
         return image
+
+    rect = cv2.minAreaRect(page_contour)
+    box = cv2.boxPoints(rect).astype(np.float32)
+
+    sums = box.sum(axis=1)
+    tl = box[np.argmin(sums)]
+    br = box[np.argmax(sums)]
+
+    diffs = np.diff(box, axis=1)
+    tr = box[np.argmin(diffs)]
+    bl = box[np.argmax(diffs)]
+
+    src = np.array([tl, tr, br, bl], dtype=np.float32)
+
+    width_a = np.linalg.norm(br - bl)
+    width_b = np.linalg.norm(tr - tl)
+    max_width = int(max(width_a, width_b))
+
+    height_a = np.linalg.norm(tr - br)
+    height_b = np.linalg.norm(tl - bl)
+    max_height = int(max(height_a, height_b))
+
+    if max_width < 200 or max_height < 200:
+        return image
+
+    dst = np.array(
+        [[0, 0], [max_width - 1, 0], [max_width - 1, max_height - 1], [0, max_height - 1]],
+        dtype=np.float32,
+    )
+
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(image, matrix, (max_width, max_height), flags=cv2.INTER_CUBIC)
 
 
 def normalize_lighting(image: np.ndarray) -> np.ndarray:
