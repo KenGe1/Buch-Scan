@@ -50,6 +50,11 @@ YOLO_MASTER_MODE = True
 YOLO_MASTER_MIN_IOU_FOR_CONTOUR_EXPAND = 0.10
 YOLO_MASTER_MAX_CONTOUR_EXPAND = 0.13
 
+# Split-line tuning: keep page separation centered in the whole image.
+SPLIT_SEARCH_WINDOW_RATIO = 0.24
+SPLIT_IMAGE_CENTER_WEIGHT = 0.85
+SPLIT_CENTER_BIAS_WEIGHT = 0.55
+
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
@@ -606,22 +611,23 @@ def detect_page_boxes(image: np.ndarray) -> List[Tuple[int, int, int, int]]:
 
 
 def find_split_line(image: np.ndarray) -> Tuple[int, float]:
-    """Estimate center gutter x-position and confidence using robust column statistics."""
+    """Estimate center gutter x-position with a strong full-image center prior."""
     gray = preprocess_image(image)
-    h, w = gray.shape[:2]
+    _, w = gray.shape[:2]
 
+    image_center = w / 2.0
+    center = image_center
     region = detect_book_region_from_image(image)
     if region is not None:
         _, (bx0, _, bx1, _) = region
-        center = (bx0 + bx1) // 2
-        book_w = max(1, bx1 - bx0)
-        window = max(20, int(book_w * 0.28))
-    else:
-        center = w // 2
-        window = max(20, w // 5)
+        book_center = (bx0 + bx1) / 2.0
+        # Keep split estimation anchored to the whole image center.
+        center = (SPLIT_IMAGE_CENTER_WEIGHT * image_center) + ((1.0 - SPLIT_IMAGE_CENTER_WEIGHT) * book_center)
 
-    start = max(0, center - window)
-    end = min(w, center + window)
+    window = max(20, int(w * SPLIT_SEARCH_WINDOW_RATIO))
+    center_i = int(round(center))
+    start = max(0, center_i - window)
+    end = min(w, center_i + window)
 
     region = gray[:, start:end]
     # Robust per-column brightness and edge measures (less sensitive to big illustrations).
@@ -636,8 +642,8 @@ def find_split_line(image: np.ndarray) -> Tuple[int, float]:
 
     idx = np.arange(score_width := region.shape[1], dtype=np.float32)
     center_bias = 1.0 - np.clip(np.abs(idx - (score_width / 2.0)) / max(1.0, score_width / 2.0), 0, 1)
-    # Soft center prior reduces false splits from edge illustrations.
-    score = darkness + 0.85 * edge_strength + 0.15 * center_bias * np.max(darkness + 1e-6)
+    # Strong center prior: keep split line near the middle of the full image.
+    score = darkness + 0.85 * edge_strength + SPLIT_CENTER_BIAS_WEIGHT * center_bias * np.max(darkness + 1e-6)
 
     local_idx = int(np.argmax(score))
     split_x = start + local_idx
