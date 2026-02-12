@@ -6,7 +6,7 @@ Ein kleines Python-Skript, das Buchfotos automatisch in saubere Seiten umwandelt
 - erkennt Doppelseiten
 - schneidet Seiten zu
 - korrigiert Perspektive
-- verbessert Licht und Lesbarkeit
+- entzerrt und bereinigt Seiten für bessere Lesbarkeit
 - speichert Ergebnisse als JPG oder als eine PDF
 
 ## Nutzung
@@ -49,6 +49,3 @@ Wenn die klassische Kontur-Erkennung bei deinen Fotos instabil ist, kannst du YO
 Für beste Ergebnisse solltest du ein eigenes Modell auf Buchseiten trainieren (Label z. B. `page` oder `book_page`) und dann `YOLO_TARGET_CLASSES` entsprechend anpassen.
 
 
-## Performance-Hinweis
-Wenn die Verarbeitung zu langsam ist, kannst du in `process.py` `ENABLE_GLOBAL_ALIGNMENT = False` setzen.
-Das deaktiviert die globale Rotations-Ausrichtung des kompletten Bildes und spart Rechenzeit, besonders bei großen Bildern.
