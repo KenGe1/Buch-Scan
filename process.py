@@ -21,11 +21,11 @@ from PIL import Image
 
 INPUT_DIR = Path(r"C:\Users\Kevin\OneDrive\Desktop\Buch test input")
 OUTPUT_DIR = Path(r"C:\Users\Kevin\OneDrive\Desktop\Buch test input\Buch test Output")
-OUTPUT_AS_PDF = True
+OUTPUT_AS_PDF = False
 PDF_FILENAME = "book_scan.pdf"
-OUTPUT_FORMAT = "jpg"  # "jpg" or "png"
+OUTPUT_FORMAT = "png"  # "jpg" or "png"
 JPEG_QUALITY = 98
-PNG_COMPRESSION = 3
+PNG_COMPRESSION = 5
 
 ENABLE_PERSPECTIVE_CORRECTION = True
 ENABLE_CROP = True
@@ -42,11 +42,18 @@ YOLO_TARGET_CLASSES: Optional[List[str]] = ["book"]
 YOLO_MIN_AREA_RATIO = 0.30
 YOLO_MIN_SIDE_RATIO = 0.35
 YOLO_MIN_MASK_COVERAGE = 0.60
+# Weight for preferring detections that cover the image center column.
+# This is more robust than relying only on the YOLO box midpoint.
 YOLO_CENTER_WEIGHT = 0.70
 YOLO_MIN_RELATIVE_TO_CONTOUR = 0.75
 YOLO_MASTER_MODE = True
 YOLO_MASTER_MIN_IOU_FOR_CONTOUR_EXPAND = 0.10
 YOLO_MASTER_MAX_CONTOUR_EXPAND = 0.13
+
+# Split-line tuning: keep page separation centered in the whole image.
+SPLIT_SEARCH_WINDOW_RATIO = 0.24
+SPLIT_IMAGE_CENTER_WEIGHT = 0.90
+SPLIT_CENTER_BIAS_WEIGHT = 0.80
 
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -100,6 +107,25 @@ def _mask_coverage(mask: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
     if roi.size == 0:
         return 0.0
     return float((roi > 0).mean())
+
+
+def _center_column_bias(bbox: Tuple[int, int, int, int], image_w: int) -> float:
+    """Score how well bbox aligns with the global image center column (0..1)."""
+    x0, _, x1, _ = bbox
+    image_center_x = image_w / 2.0
+
+    # Strong prior: best if the actual image center lies inside the detection box.
+    center_inside = 1.0 if x0 <= image_center_x <= x1 else 0.0
+
+    # Smooth fallback: if not inside, prefer boxes close to image center.
+    if center_inside > 0.0:
+        distance_score = 1.0
+    else:
+        edge_distance = min(abs(image_center_x - x0), abs(image_center_x - x1))
+        distance_score = max(0.0, 1.0 - (edge_distance / max(1.0, image_w / 2.0)))
+
+    # "center_inside" dominates; distance_score helps when no candidate covers center.
+    return 0.85 * center_inside + 0.15 * distance_score
 
 
 
@@ -214,9 +240,13 @@ def _detect_book_region_yolo(
             continue
 
         conf = float(box.conf[0].item()) if box.conf is not None else 0.0
-        center_x = (x0 + x1) / 2.0
-        center_bias = 1.0 - abs(center_x - (w / 2.0)) / max(1.0, (w / 2.0))
-        score = (conf * 0.50) + (area_ratio * 0.20) + (coverage * 0.30) + (YOLO_CENTER_WEIGHT * center_bias)
+        center_bias = _center_column_bias(candidate, w)
+        score = (
+            (conf * 0.50)
+            + (area_ratio * 0.20)
+            + (coverage * 0.30)
+            + (YOLO_CENTER_WEIGHT * center_bias)
+        )
 
         if expected_bbox is not None:
             score += 0.35 * _bbox_iou(candidate, expected_bbox)
@@ -581,22 +611,23 @@ def detect_page_boxes(image: np.ndarray) -> List[Tuple[int, int, int, int]]:
 
 
 def find_split_line(image: np.ndarray) -> Tuple[int, float]:
-    """Estimate center gutter x-position and confidence using robust column statistics."""
+    """Estimate center gutter x-position with a strong full-image center prior."""
     gray = preprocess_image(image)
-    h, w = gray.shape[:2]
+    _, w = gray.shape[:2]
 
+    image_center = w / 2.0
+    center = image_center
     region = detect_book_region_from_image(image)
     if region is not None:
         _, (bx0, _, bx1, _) = region
-        center = (bx0 + bx1) // 2
-        book_w = max(1, bx1 - bx0)
-        window = max(20, int(book_w * 0.28))
-    else:
-        center = w // 2
-        window = max(20, w // 5)
+        book_center = (bx0 + bx1) / 2.0
+        # Keep split estimation anchored to the whole image center.
+        center = (SPLIT_IMAGE_CENTER_WEIGHT * image_center) + ((1.0 - SPLIT_IMAGE_CENTER_WEIGHT) * book_center)
 
-    start = max(0, center - window)
-    end = min(w, center + window)
+    window = max(20, int(w * SPLIT_SEARCH_WINDOW_RATIO))
+    center_i = int(round(center))
+    start = max(0, center_i - window)
+    end = min(w, center_i + window)
 
     region = gray[:, start:end]
     # Robust per-column brightness and edge measures (less sensitive to big illustrations).
@@ -611,8 +642,8 @@ def find_split_line(image: np.ndarray) -> Tuple[int, float]:
 
     idx = np.arange(score_width := region.shape[1], dtype=np.float32)
     center_bias = 1.0 - np.clip(np.abs(idx - (score_width / 2.0)) / max(1.0, score_width / 2.0), 0, 1)
-    # Soft center prior reduces false splits from edge illustrations.
-    score = darkness + 0.85 * edge_strength + 0.15 * center_bias * np.max(darkness + 1e-6)
+    # Strong center prior: keep split line near the middle of the full image.
+    score = darkness + 0.85 * edge_strength + SPLIT_CENTER_BIAS_WEIGHT * center_bias * np.max(darkness + 1e-6)
 
     local_idx = int(np.argmax(score))
     split_x = start + local_idx
